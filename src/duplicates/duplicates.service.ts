@@ -17,7 +17,7 @@ export class DuplicatesService {
     const check = await this.db.duplicateCheck.findFirst({
       where: { id, workspaceId: identity.workspaceId },
       include: {
-        material: { select: { id: true, name: true, createdAt: true, readStatus: true, errorCode: true } },
+        material: { select: { id: true, name: true, segments: true, createdAt: true, readStatus: true, errorCode: true } },
         existingCandidate: {
           select: {
             id: true, displayName: true, email: true, phone: true, createdAt: true,
@@ -32,16 +32,25 @@ export class DuplicatesService {
     });
     if (!check) throw new NotFoundException({ code: 'NOT_FOUND' });
     const existingVersion = check.existingCandidate?.resumeVersions[0];
+    // The uploaded side has no Candidate yet (that's the whole question this review is
+    // answering), so its email/phone/location can only come from re-reading the material.
+    const uploadedSignals = check.material.readStatus === 'available'
+      ? this.profiles.extractIdentitySignals(check.material.id, check.material.segments, displayNameFromFileName(check.material.name))
+      : null;
     return {
       id: check.id,
       kind: check.kind,
       status: check.status,
+      confidence: check.confidence ?? undefined,
       uploaded: {
         fileName: check.material.name,
         uploadedAt: check.material.createdAt.toISOString(),
         source: 'Manual upload',
         uploadedBy: 'emma',
-        name: displayNameFromFileName(check.material.name),
+        name: uploadedSignals?.displayName || displayNameFromFileName(check.material.name),
+        email: uploadedSignals?.email || undefined,
+        phone: uploadedSignals?.phone || undefined,
+        location: uploadedSignals?.location || undefined,
       },
       existing: check.existingCandidate
         ? {

@@ -170,6 +170,8 @@ function toFrontendApplication(application: {
   linkedAt: Date;
   linkedBy: string;
   linkReason: string;
+  candidate?: { id: string; displayName: string };
+  job?: { id: string; title: string };
 }) {
   return {
     id: application.id,
@@ -183,5 +185,7 @@ function toFrontendApplication(application: {
     linkedAt: application.linkedAt.toISOString(),
     linkedBy: application.linkedBy,
     linkReason: application.linkReason,
+    candidateName: application.candidate?.displayName,
+    jobTitle: application.job?.title,
   };
 }

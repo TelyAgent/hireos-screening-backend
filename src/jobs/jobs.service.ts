@@ -252,7 +252,7 @@ export class JobsService {
       }),
       this.db.job.update({
         where: { id: job.id },
-        data: { criteriaStatus: 'confirmed', criteriaVersion: confirmedVersion, confirmedBy: actorId, confirmedAt },
+        data: { criteriaStatus: 'confirmed', criteriaVersion: confirmedVersion, confirmedBy: actorId, confirmedAt, status: 'open' },
       }),
     ]);
     return this.get(identity, id);
@@ -343,6 +343,11 @@ export class JobsService {
             criteriaVersion: confirmedVersion,
             confirmedBy: projection.confirmedBy,
             confirmedAt,
+            // Confirming criteria is the only gate the product has for "is this job real
+            // enough to match against" -- there is no separate publish/open action
+            // anywhere in the UI or API, so a job must become open here or it can never
+            // become open at all, and discovery matching would silently find nothing.
+            status: 'open',
           },
         });
         return;

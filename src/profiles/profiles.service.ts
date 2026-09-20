@@ -5,6 +5,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
 import { ProfileParserService } from './profile-parser.service';
+import { DiscoveryService } from '../discovery/discovery.service';
 
 @Injectable()
 export class ProfilesService implements OnModuleInit, OnModuleDestroy {
@@ -14,6 +15,7 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly db: PrismaService,
     private readonly parser: ProfileParserService,
+    private readonly discovery: DiscoveryService,
   ) {}
 
   onModuleInit() {
@@ -44,7 +46,7 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
   // before a Candidate even exists yet.
   extractIdentitySignals(materialId: string, segments: unknown, fallbackName: string) {
     const parsed = this.parser.parse(materialId, asSegments(segments), fallbackName);
-    return { displayName: parsed.displayName, email: parsed.email, phone: parsed.phone };
+    return { displayName: parsed.displayName, email: parsed.email, phone: parsed.phone, location: parsed.location?.value || null };
   }
 
   async getLatest(identity: Identity, candidateId: string) {
@@ -248,6 +250,10 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
         });
         return created;
       });
+      // PRD: matching runs automatically once a profile exists, not on a manual button
+      // press. Enqueued after commit so a slow/failing match run can never roll back or
+      // block the profile that triggered it.
+      await this.discovery.enqueueAutoMatch(job.workspaceId, candidate.id);
       return profile;
     } catch (error) {
       await this.db.processingJob.update({

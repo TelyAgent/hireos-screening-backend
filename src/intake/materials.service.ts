@@ -37,7 +37,7 @@ export class MaterialsService {
       throw new BadRequestException({ code: 'FILE_TOO_LARGE', maxBytes: MAX_FILE_SIZE });
     }
 
-    const originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
+    const originalName = decodeOriginalFileName(file.originalname);
     const hash = createHash('sha256').update(file.buffer).digest('hex');
     const existing = await this.db.material.findFirst({
       where: { workspaceId, hash },
@@ -188,6 +188,15 @@ export class MaterialsService {
 // Lowercases and collapses everything but alphanumerics/CJK to single spaces, so the same
 // resume re-extracted from a different container format (PDF vs DOCX) or with cosmetic
 // whitespace/punctuation differences still hashes identically.
+// Node's HTTP parser decodes multipart header fields (including the filename in
+// Content-Disposition) as latin1 per the HTTP spec, even when the browser sent a UTF-8
+// filename. Multer/busboy pass that mis-decoded string straight through as
+// `file.originalname`, so every non-ASCII filename needs this reversed before it's stored
+// or displayed anywhere -- not just where the Material row happens to read it.
+export function decodeOriginalFileName(name: string): string {
+  return Buffer.from(name, 'latin1').toString('utf8');
+}
+
 export function normalizeTextForDedupe(text: string): string {
   return text
     .toLowerCase()

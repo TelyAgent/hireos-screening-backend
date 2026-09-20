@@ -1,6 +1,13 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
+import { AiMatcherService, AiMatchError, type JobDimensionInput, type JobRequirementInput } from './ai-matcher.service';
+
+const AUTO_MATCH_JOB = 'job_discovery_match';
+const AUTO_MATCH_LEASE_MS = 120_000;
+const RECOMMENDATION_THRESHOLD = 35;
 
 type JsonRecord = Record<string, unknown>;
 type ProfileForMatch = {
@@ -9,53 +16,60 @@ type ProfileForMatch = {
   workAuthorization: unknown;
   location: unknown;
 };
-type CandidateForMatch = { id: string; profiles: ProfileForMatch[] };
+type CandidateForMatch = {
+  id: string;
+  displayName: string;
+  profiles: ProfileForMatch[];
+  resumeVersions: { material: { text: string } }[];
+};
 type CriteriaForMatch = { version: number; requirements: unknown; dimensions: unknown };
-type JobForMatch = { id: string; criteriaVersions: CriteriaForMatch[] };
+type JobForMatch = { id: string; title: string; team: string; seniority: string; location: string; criteriaVersions: CriteriaForMatch[] };
+
+const CANDIDATE_MATCH_INCLUDE = {
+  profiles: { orderBy: { version: 'desc' as const }, take: 1 },
+  resumeVersions: {
+    where: { isLatest: true },
+    take: 1,
+    include: { material: { select: { text: true } } },
+  },
+};
 
 @Injectable()
-export class DiscoveryService {
-  constructor(private readonly db: PrismaService) {}
+export class DiscoveryService implements OnModuleInit, OnModuleDestroy {
+  private timer?: ReturnType<typeof globalThis.setInterval>;
+  private running = false;
+
+  constructor(
+    private readonly db: PrismaService,
+    private readonly aiMatcher: AiMatcherService,
+  ) {}
+
+  onModuleInit() {
+    this.timer = globalThis.setInterval(() => void this.processQueuedMatchJobs(), 250);
+    this.timer.unref();
+  }
+
+  onModuleDestroy() {
+    if (this.timer) globalThis.clearInterval(this.timer);
+  }
+
+  // Called right after a resume finishes parsing (PRD: matching is automatic, not a
+  // button the recruiter has to remember to click). Runs through the same durable job
+  // queue every other async step in this service uses, so a slow or failing AI call
+  // never blocks the resume-parse worker that triggered it.
+  async enqueueAutoMatch(workspaceId: string, candidateId: string) {
+    await this.db.processingJob.create({
+      data: { workspaceId, candidateId, type: AUTO_MATCH_JOB, input: { candidateId } },
+    });
+  }
 
   async matchCandidate(identity: Identity, candidateId: string) {
     const candidate = await this.db.candidate.findFirst({
       where: { id: candidateId, workspaceId: identity.workspaceId },
-      include: { profiles: { orderBy: { version: 'desc' }, take: 1 } },
+      include: CANDIDATE_MATCH_INCLUDE,
     });
     if (!candidate) throw new NotFoundException({ code: 'NOT_FOUND' });
-    const openJobs = await this.db.job.findMany({
-      where: { workspaceId: identity.workspaceId, status: 'open' },
-      include: { criteriaVersions: { where: { status: 'confirmed' }, orderBy: { version: 'desc' }, take: 1 } },
-    });
-    const run = await this.db.jobDiscoveryRun.create({
-      data: {
-        workspaceId: identity.workspaceId,
-        candidateId,
-        status: openJobs.length ? 'running' : 'no_open_jobs',
-        jobsScanned: 0,
-        reason: openJobs.length ? undefined : { code: 'NO_OPEN_JOBS', message: 'No open jobs are available.' },
-        completedAt: openJobs.length ? undefined : new Date(),
-      },
-    });
-    if (!openJobs.length) {
-      await this.db.candidate.update({ where: { id: candidateId }, data: { lastMatchedAt: new Date() } });
-      return serializeRun(run);
-    }
-    if (!candidate.profiles[0]) {
-      const failed = await this.db.jobDiscoveryRun.update({
-        where: { id: run.id },
-        data: {
-          status: 'insufficient_data',
-          jobsScanned: 0,
-          reason: { code: 'PROFILE_NOT_READY', message: 'Candidate profile parsing has not completed.' },
-          completedAt: new Date(),
-        },
-      });
-      return serializeRun(failed);
-    }
-    const result = await this.evaluateCandidateAgainstJobs(identity, candidate, openJobs, run.id);
-    await this.db.candidate.update({ where: { id: candidateId }, data: { lastMatchedAt: new Date() } });
-    return serializeRun(result.run);
+    return serializeRun(await this.runMatchForCandidate(identity.workspaceId, candidate));
   }
 
   async matchJob(identity: Identity, jobId: string) {
@@ -67,26 +81,21 @@ export class DiscoveryService {
     if (!job.criteriaVersions[0]) throw new BadRequestException({ code: 'CRITERIA_NOT_CONFIRMED' });
     const candidates = await this.db.candidate.findMany({
       where: { workspaceId: identity.workspaceId, libraryStatus: 'available' },
-      include: { profiles: { orderBy: { version: 'desc' }, take: 1 } },
+      include: CANDIDATE_MATCH_INCLUDE,
     });
     const summaries = [];
     for (const candidate of candidates) {
       const run = await this.db.jobDiscoveryRun.create({
-        data: {
-          workspaceId: identity.workspaceId,
-          candidateId: candidate.id,
-          jobId: job.id,
-          status: 'running',
-        },
+        data: { workspaceId: identity.workspaceId, candidateId: candidate.id, jobId: job.id, status: 'running' },
       });
-      const result = await this.matchCandidateForJob(identity, candidate, job, run.id);
+      const result = await this.matchCandidateForJob(identity.workspaceId, candidate, job, run.id);
       const completed = await this.db.jobDiscoveryRun.update({
         where: { id: run.id },
         data: {
           status: result.status,
           jobsScanned: 1,
           completedAt: new Date(),
-          reason: result.status === 'no_match' ? { code: 'NO_MATCH', message: 'No current match for this role.' } : undefined,
+          reason: reasonFor(result.status),
         },
       });
       summaries.push({ ...result, run: completed });
@@ -97,6 +106,17 @@ export class DiscoveryService {
       candidatesScanned: candidates.length,
       recommendationsCreated: summaries.reduce((sum, item) => sum + item.recommendationsCreated, 0),
     };
+  }
+
+  async listJobRecommendations(identity: Identity, jobId: string) {
+    const job = await this.db.job.findFirst({ where: { id: jobId, workspaceId: identity.workspaceId }, select: { id: true } });
+    if (!job) throw new NotFoundException({ code: 'NOT_FOUND' });
+    const recommendations = await this.db.candidateJobRecommendation.findMany({
+      where: { workspaceId: identity.workspaceId, jobId, status: 'proposed' },
+      orderBy: { createdAt: 'desc' },
+      include: { candidate: { select: { displayName: true } } },
+    });
+    return recommendations.map((r) => ({ ...toFrontendRecommendation(r), candidateName: r.candidate.displayName }));
   }
 
   async listCandidateRecommendations(identity: Identity, candidateId: string) {
@@ -153,71 +173,198 @@ export class DiscoveryService {
     return toFrontendRecommendation(recommendation);
   }
 
-  private async evaluateCandidateAgainstJobs(identity: Identity, candidate: CandidateForMatch, jobs: JobForMatch[], runId: string) {
-    let recommendationsCreated = 0;
-    for (const job of jobs) {
-      const result = await this.matchCandidateForJob(identity, candidate, job, runId);
-      recommendationsCreated += result.recommendationsCreated;
+  private async processQueuedMatchJobs() {
+    if (this.running) return;
+    this.running = true;
+    try {
+      const now = new Date();
+      const job = await this.db.processingJob.findFirst({
+        where: {
+          type: AUTO_MATCH_JOB,
+          OR: [
+            { status: 'queued', nextRunAt: { lte: now } },
+            { status: 'running', leaseUntil: { lt: now } },
+          ],
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+      if (!job) return;
+      const leaseToken = randomUUID();
+      const claimed = await this.db.processingJob.updateMany({
+        where: { id: job.id, status: job.status },
+        data: { status: 'running', attempt: { increment: 1 }, leaseToken, leaseUntil: new Date(Date.now() + AUTO_MATCH_LEASE_MS) },
+      });
+      if (claimed.count !== 1) return;
+      await this.processClaimedMatchJob(job.id, leaseToken);
+    } finally {
+      this.running = false;
     }
-    const recommendations = await this.db.candidateJobRecommendation.count({ where: { discoveryRunId: runId } });
+  }
+
+  private async processClaimedMatchJob(jobId: string, leaseToken: string) {
+    const job = await this.db.processingJob.findFirst({ where: { id: jobId, leaseToken } });
+    if (!job || !job.candidateId) return;
+    try {
+      const candidate = await this.db.candidate.findFirst({
+        where: { id: job.candidateId, workspaceId: job.workspaceId },
+        include: CANDIDATE_MATCH_INCLUDE,
+      });
+      if (!candidate) throw new Error('CANDIDATE_NOT_FOUND');
+      await this.runMatchForCandidate(job.workspaceId, candidate);
+      await this.db.processingJob.update({ where: { id: job.id }, data: { status: 'succeeded', leaseToken: null, leaseUntil: null } });
+    } catch (error) {
+      await this.db.processingJob.update({
+        where: { id: job.id },
+        data: { status: 'failed', errorCode: error instanceof Error ? error.message.slice(0, 100) : 'MATCH_FAILED', leaseToken: null, leaseUntil: null },
+      });
+    }
+  }
+
+  private async runMatchForCandidate(workspaceId: string, candidate: CandidateForMatch) {
+    const openJobs = await this.db.job.findMany({
+      where: { workspaceId, status: 'open' },
+      include: { criteriaVersions: { where: { status: 'confirmed' }, orderBy: { version: 'desc' }, take: 1 } },
+    });
+    const run = await this.db.jobDiscoveryRun.create({
+      data: {
+        workspaceId,
+        candidateId: candidate.id,
+        status: openJobs.length ? 'running' : 'no_open_jobs',
+        jobsScanned: 0,
+        reason: openJobs.length ? undefined : { code: 'NO_OPEN_JOBS', message: 'No open jobs are available.' },
+        completedAt: openJobs.length ? undefined : new Date(),
+      },
+    });
+    if (!openJobs.length) {
+      await this.db.candidate.update({ where: { id: candidate.id }, data: { lastMatchedAt: new Date() } });
+      return run;
+    }
+    if (!candidate.profiles[0]) {
+      const failed = await this.db.jobDiscoveryRun.update({
+        where: { id: run.id },
+        data: {
+          status: 'insufficient_data',
+          jobsScanned: 0,
+          reason: { code: 'PROFILE_NOT_READY', message: 'Candidate profile parsing has not completed.' },
+          completedAt: new Date(),
+        },
+      });
+      return failed;
+    }
+    const result = await this.evaluateCandidateAgainstJobs(workspaceId, candidate, openJobs, run.id);
+    await this.db.candidate.update({ where: { id: candidate.id }, data: { lastMatchedAt: new Date() } });
+    return result.run;
+  }
+
+  private async evaluateCandidateAgainstJobs(workspaceId: string, candidate: CandidateForMatch, jobs: JobForMatch[], runId: string) {
+    let recommendationsCreated = 0;
+    let anyFailed = false;
+    for (const job of jobs) {
+      const result = await this.matchCandidateForJob(workspaceId, candidate, job, runId);
+      recommendationsCreated += result.recommendationsCreated;
+      if (result.status === 'failed') anyFailed = true;
+    }
+    // A run-level AI failure must stay visibly distinct from "no open role fit" -- folding
+    // it into no_match would tell a recruiter "we checked, nothing matched" when the truth
+    // is "we couldn't check at all". Only report failed once nothing else redeems the run.
+    const status = recommendationsCreated
+      ? 'recommendations_ready'
+      : anyFailed ? 'failed' : 'no_match';
     const run = await this.db.jobDiscoveryRun.update({
       where: { id: runId },
-      data: {
-        status: recommendations ? 'recommendations_ready' : 'no_match',
-        jobsScanned: jobs.length,
-        reason: recommendations ? undefined : { code: 'NO_MATCH', message: 'No current open role met the local matching threshold.' },
-        completedAt: new Date(),
-      },
+      data: { status, jobsScanned: jobs.length, reason: reasonFor(status), completedAt: new Date() },
     });
     return { run, recommendationsCreated };
   }
 
-  private async matchCandidateForJob(identity: Identity, candidate: CandidateForMatch, job: JobForMatch, runId?: string) {
+  private async matchCandidateForJob(
+    workspaceId: string,
+    candidate: CandidateForMatch,
+    job: JobForMatch,
+    runId?: string,
+  ): Promise<{ status: string; recommendationsCreated: number }> {
     const profile = candidate.profiles?.[0];
     const criteria = job.criteriaVersions?.[0];
     if (!criteria || !profile) return { status: 'insufficient_data', recommendationsCreated: 0 };
-    const requirements = asArray(criteria.requirements);
-    const dimensions = asArray(criteria.dimensions);
-    const corpus = profileCorpus(profile);
-    const matched = requirements.filter((requirement) => requirementMatches(requirement, corpus));
-    const gaps = requirements
-      .filter((requirement) => !requirementMatches(requirement, corpus))
-      .map((requirement) => String(requirement.label || 'Unknown requirement'));
-    const coverage = dimensions.length ? Math.min(1, 0.5 + matched.length / Math.max(requirements.length, 1) / 2) : 0;
-    const overallScore = requirements.length ? Math.round((matched.length / requirements.length) * 100) : 50;
-    const status = overallScore >= 35 ? 'recommendations_ready' : 'no_match';
+
+    const requirements = asArray(criteria.requirements) as unknown as JobRequirementInput[];
+    const dimensions = asArray(criteria.dimensions) as unknown as JobDimensionInput[];
+    const resumeText = candidate.resumeVersions[0]?.material.text || '';
+
+    let evaluation: {
+      overallScore: number;
+      coverage: number;
+      confidence: number;
+      rationale: string;
+      gaps: string[];
+      evidence: Prisma.InputJsonValue;
+      proposalSource: string;
+    };
+
+    if (this.aiMatcher.isConfigured() && resumeText) {
+      try {
+        const ai = await this.aiMatcher.evaluate({
+          jobTitle: job.title,
+          jobTeam: job.team,
+          jobSeniority: job.seniority,
+          jobLocation: job.location,
+          requirements,
+          dimensions,
+          resumeText,
+        });
+        evaluation = {
+          overallScore: ai.overallScore,
+          coverage: ai.coverage,
+          confidence: ai.confidence,
+          rationale: ai.rationale,
+          gaps: ai.gaps,
+          evidence: ai.requirementFindings
+            .filter((f) => f.met)
+            .map((f) => ({ requirementId: f.requirementId, evidence: f.evidence })),
+          proposalSource: 'ai',
+        };
+      } catch (error) {
+        const detail = error instanceof AiMatchError ? error.message : 'AI_REQUEST_FAILED';
+        console.error(`[DiscoveryService] AI match failed for candidate ${candidate.id} / job ${job.id}: ${detail}`);
+        return { status: 'failed', recommendationsCreated: 0 };
+      }
+    } else {
+      evaluation = localRuleMatch(requirements, dimensions, profile);
+    }
+
+    const status = evaluation.overallScore >= RECOMMENDATION_THRESHOLD ? 'recommendations_ready' : 'no_match';
     if (runId && status === 'recommendations_ready') {
       await this.db.candidateJobRecommendation.updateMany({
-        where: { workspaceId: identity.workspaceId, candidateId: candidate.id, jobId: job.id, status: 'proposed' },
+        where: { workspaceId, candidateId: candidate.id, jobId: job.id, status: 'proposed' },
         data: { status: 'stale', staleReason: 'Replaced by a newer discovery run.' },
       });
-      const evaluation = await this.db.preLinkMatchEvaluation.create({
+      const persistedEvaluation = await this.db.preLinkMatchEvaluation.create({
         data: {
-          workspaceId: identity.workspaceId,
+          workspaceId,
           candidateId: candidate.id,
           jobId: job.id,
           discoveryRunId: runId,
           profileVersion: profile.version,
           criteriaVersion: criteria.version,
           status: 'completed',
-          overallScore,
-          coverage,
-          rationale: `Local evidence matcher found ${matched.length} of ${requirements.length || 0} listed requirements.`,
-          gaps,
-          evidence: matched.map((item) => ({ requirementId: String(item.id || ''), label: String(item.label || '') })),
+          overallScore: evaluation.overallScore,
+          coverage: evaluation.coverage,
+          rationale: evaluation.rationale,
+          gaps: evaluation.gaps,
+          evidence: evaluation.evidence,
         },
       });
       await this.db.candidateJobRecommendation.create({
         data: {
-          workspaceId: identity.workspaceId,
+          workspaceId,
           candidateId: candidate.id,
           jobId: job.id,
-          prelinkEvaluationId: evaluation.id,
+          prelinkEvaluationId: persistedEvaluation.id,
           discoveryRunId: runId,
-          confidence: Math.round((overallScore / 100) * 100) / 100,
+          confidence: Math.round(evaluation.confidence * 100) / 100,
           rationale: evaluation.rationale,
-          gaps,
-          proposalSource: 'local_rule',
+          gaps: evaluation.gaps,
+          proposalSource: evaluation.proposalSource,
         },
       });
     }
@@ -229,6 +376,31 @@ export class DiscoveryService {
     if (!recommendation) throw new NotFoundException({ code: 'NOT_FOUND' });
     return toFrontendRecommendation(await this.db.candidateJobRecommendation.update({ where: { id }, data: { status } }));
   }
+}
+
+// Used only when no AI provider is configured, so the feature still works (at reduced
+// quality) in environments without an API key -- e.g. this repo checked out fresh.
+function localRuleMatch(requirements: JobRequirementInput[], dimensions: JobDimensionInput[], profile: ProfileForMatch) {
+  const corpus = profileCorpus(profile);
+  const matched = requirements.filter((requirement) => requirementMatches(requirement, corpus));
+  const gaps = requirements.filter((requirement) => !requirementMatches(requirement, corpus)).map((r) => r.label || 'Unknown requirement');
+  const coverage = dimensions.length ? Math.min(1, 0.5 + matched.length / Math.max(requirements.length, 1) / 2) : 0;
+  const overallScore = requirements.length ? Math.round((matched.length / requirements.length) * 100) : 50;
+  return {
+    overallScore,
+    coverage,
+    confidence: 0.4,
+    rationale: `Local keyword matcher found ${matched.length} of ${requirements.length || 0} listed requirements.`,
+    gaps,
+    evidence: matched.map((item) => ({ requirementId: String(item.id || ''), label: String(item.label || '') })),
+    proposalSource: 'local_rule',
+  };
+}
+
+function reasonFor(status: string): Prisma.InputJsonValue | undefined {
+  if (status === 'no_match') return { code: 'NO_MATCH', message: 'No current open role met the matching threshold.' };
+  if (status === 'failed') return { code: 'AI_MATCH_FAILED', message: 'The AI matcher could not complete this run. Retry matching.' };
+  return undefined;
 }
 
 function asArray(value: unknown): JsonRecord[] {
@@ -244,7 +416,7 @@ function profileCorpus(profile: ProfileForMatch) {
   return `${skills.join(' ')} ${workAuth} ${location}`.toLowerCase();
 }
 
-function requirementMatches(requirement: JsonRecord, corpus: string) {
+function requirementMatches(requirement: JobRequirementInput, corpus: string) {
   const tokens = String(requirement.label || '')
     .toLowerCase()
     .split(/[^a-z0-9+#]+/)

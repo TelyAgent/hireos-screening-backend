@@ -1,4 +1,4 @@
-import { Controller, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
 import { WorkspaceGuard, type Identity } from '../auth/workspace.guard';
 import { DiscoveryService } from './discovery.service';
 
@@ -15,6 +15,11 @@ export class DiscoveryController {
   @Post('jobs/:id/match')
   matchJob(@Req() req: { identity: Identity }, @Param('id') id: string) {
     return this.discovery.matchJob(req.identity, id);
+  }
+
+  @Get('jobs/:id/recommendations')
+  listJobRecommendations(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.discovery.listJobRecommendations(req.identity, id);
   }
 
   @Post('candidates/:candidateId/jobs/:jobId/recommend')

@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
-import { MaterialsService } from './materials.service';
+import { decodeOriginalFileName, MaterialsService } from './materials.service';
 import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
 import { CoreRecordClient } from '../core-record/core-record.client';
@@ -89,7 +89,7 @@ export class ImportsService implements OnModuleInit, OnModuleDestroy {
         data: {
           batchId: batch.id,
           workspaceId: identity.workspaceId,
-          fileName: file.originalname,
+          fileName: decodeOriginalFileName(file.originalname),
           sizeKB: Math.max(1, Math.round(file.size / 1024)),
           outcome: 'received',
           stage: 'received',
@@ -452,7 +452,12 @@ export class ImportsService implements OnModuleInit, OnModuleDestroy {
             candidateId: match.candidate.id,
             materialId: material.id,
             duplicateReviewId: check.id,
-            queue: 'resume_identity_review',
+            // Single-operator dev setup: whoever uploaded the file is the only person who
+            // could review it, so hand it straight to them instead of parking it in an
+            // unclaimed queue nobody else will ever pick up. Once real multi-user accounts
+            // exist, this should go back to an unassigned queue for the right reviewer.
+            assigneeId: identity.actorId,
+            queue: null,
             // Confidence drives urgency: a strong signal (matched email/phone/identical
             // text) is worth a human's attention sooner than a weak name-only guess.
             priority: match.confidence >= 0.8 ? 'high' : 'normal',
