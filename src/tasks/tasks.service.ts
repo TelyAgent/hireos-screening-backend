@@ -49,6 +49,14 @@ export class TasksService {
   async complete(identity: Identity, id: string, completionRef?: string) {
     const task = await this.find(identity.workspaceId, id);
     if (task.status === 'cancelled') throw new BadRequestException({ code: 'TASK_CANCELLED' });
+    const requiredResultType = (task.completionRule as { requiredResultType?: string } | null)?.requiredResultType;
+    if (requiredResultType === 'duplicate_resolution') {
+      // A duplicate-review task can only be closed by actually recording a decision
+      // (same person / different person / reuse file) through the duplicates endpoint --
+      // that path records the outcome, the audit trail, and the Candidate relationship.
+      // Completing it here directly would mark the review "done" with no decision made.
+      throw new BadRequestException({ code: 'RESOLVE_VIA_DUPLICATE_REVIEW', duplicateReviewId: task.duplicateReviewId });
+    }
     const completed = await this.db.humanTask.update({
       where: { id },
       data: { status: 'completed', completedAt: new Date(), completionRef: completionRef || task.applicationId || undefined },

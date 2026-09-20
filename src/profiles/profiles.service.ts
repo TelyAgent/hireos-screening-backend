@@ -38,6 +38,15 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  // Cheap, synchronous, local-only extraction of just the fields identity/duplicate
+  // matching needs. This intentionally stays separate from the full async profile parse
+  // (which also writes CandidateProfile/ResumeVersion state) so intake can consult it
+  // before a Candidate even exists yet.
+  extractIdentitySignals(materialId: string, segments: unknown, fallbackName: string) {
+    const parsed = this.parser.parse(materialId, asSegments(segments), fallbackName);
+    return { displayName: parsed.displayName, email: parsed.email, phone: parsed.phone };
+  }
+
   async getLatest(identity: Identity, candidateId: string) {
     const candidate = await this.db.candidate.findFirst({
       where: { id: candidateId, workspaceId: identity.workspaceId },

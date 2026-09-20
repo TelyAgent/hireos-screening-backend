@@ -17,6 +17,11 @@ export class JobsController {
     return this.jobs.create(req.identity, body);
   }
 
+  @Post('import')
+  import(@Req() req: { identity: Identity }, @Body() body: unknown) {
+    return this.jobs.importFromSource(req.identity, body);
+  }
+
   @Get(':id')
   get(@Req() req: { identity: Identity }, @Param('id') id: string) {
     return this.jobs.get(req.identity, id);

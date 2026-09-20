@@ -8,12 +8,17 @@ import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { PDFParse } from 'pdf-parse';
 import * as mammoth from 'mammoth';
 import { PrismaService } from '../persistence/prisma.service';
+import type { ImportChannel } from './imports.types';
+import { SecurityScanService } from './security-scan.service';
 
 type Segment = { id: string; text: string; page?: number };
 type MulterFile = Express.Multer.File;
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024;
 const MAX_TEXT_SIZE = 150000;
+// Below this length, extracted text is too sparse to reliably identify a real duplicate
+// (two failed/near-empty extractions would otherwise collide on the same hash).
+const MIN_TEXT_HASH_LENGTH = 200;
 const PDFJS_DIR = dirname(require.resolve('pdfjs-dist/package.json'));
 const PDF_CMAP_URL = join(PDFJS_DIR, 'cmaps') + '/';
 const PDF_STANDARD_FONT_DATA_URL = join(PDFJS_DIR, 'standard_fonts') + '/';
@@ -23,22 +28,35 @@ export class MaterialsService {
   constructor(
     private readonly db: PrismaService,
     private readonly config: ConfigService,
+    private readonly securityScan: SecurityScanService,
   ) {}
 
-  async saveUpload(workspaceId: string, file?: MulterFile) {
+  async saveUpload(workspaceId: string, file?: MulterFile, sourceType: ImportChannel = 'manual_upload') {
     if (!file || !file.size) throw new BadRequestException({ code: 'EMPTY_FILE' });
     if (file.size > MAX_FILE_SIZE) {
       throw new BadRequestException({ code: 'FILE_TOO_LARGE', maxBytes: MAX_FILE_SIZE });
     }
 
     const originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
-    const parsed = await this.extract(originalName, file.mimetype, file.buffer);
     const hash = createHash('sha256').update(file.buffer).digest('hex');
     const existing = await this.db.material.findFirst({
       where: { workspaceId, hash },
       select: { id: true, name: true, size: true, hash: true, readStatus: true, errorCode: true },
     });
     if (existing) return { kind: 'exact_file' as const, material: existing };
+
+    // Every new file is scanned before extraction ever touches its bytes. A quarantined
+    // file is still recorded (for audit) but never parsed, so its text can never leak
+    // into a candidate profile.
+    const scan = this.securityScan.scan(file.buffer, file.mimetype, originalName);
+    const parsed = scan.status === 'quarantined'
+      ? { mime: file.mimetype, text: '', segments: [] as Segment[], errorCode: scan.reason ?? 'SECURITY_QUARANTINED' }
+      : await this.extract(originalName, file.mimetype, file.buffer);
+
+    const normalizedText = normalizeTextForDedupe(parsed.text);
+    const normalizedTextHash = normalizedText.length >= MIN_TEXT_HASH_LENGTH
+      ? createHash('sha256').update(normalizedText).digest('hex')
+      : null;
 
     const storageRoot = resolve(this.config.get<string>('STORAGE_DIR', '.local/materials'));
     await mkdir(storageRoot, { recursive: true, mode: 0o700 });
@@ -54,10 +72,14 @@ export class MaterialsService {
           mime: parsed.mime,
           size: file.size,
           hash,
+          normalizedTextHash,
           storageKey,
           text: parsed.text,
           segments: parsed.segments,
-          readStatus: parsed.errorCode ? 'failed' : 'available',
+          readStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
+          securityStatus: scan.status,
+          extractionStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
+          sourceType,
           errorCode: parsed.errorCode,
         },
       });
@@ -73,7 +95,8 @@ export class MaterialsService {
       where: { id, workspaceId },
       select: {
         id: true, name: true, mime: true, size: true, hash: true, text: true,
-        segments: true, readStatus: true, errorCode: true, createdAt: true,
+        segments: true, readStatus: true, securityStatus: true, extractionStatus: true,
+        sourceType: true, sourceRef: true, sourceVersion: true, errorCode: true, createdAt: true,
       },
     });
     if (!material) throw new NotFoundException({ code: 'NOT_FOUND' });
@@ -98,10 +121,10 @@ export class MaterialsService {
       source: 'Manual upload',
       uploadedAt: material.createdAt.toISOString(),
       readStatus: material.readStatus === 'available' ? 'available' : material.readStatus,
-      extraction: material.errorCode
-        ? material.errorCode === 'OCR_REQUIRED' ? 'blocked' : 'failed'
-        : material.text ? 'complete' : 'partial',
-      security: 'passed',
+      extraction: material.extractionStatus === 'blocked' || material.errorCode === 'OCR_REQUIRED'
+        ? 'blocked'
+        : material.errorCode ? 'failed' : material.text ? 'complete' : 'partial',
+      security: material.securityStatus,
       linked: material.resumeVersion?.candidate.displayName || 'Unassigned',
     }));
   }
@@ -160,6 +183,17 @@ export class MaterialsService {
       return { mime, text: '', segments: [], errorCode: 'FILE_UNREADABLE' };
     }
   }
+}
+
+// Lowercases and collapses everything but alphanumerics/CJK to single spaces, so the same
+// resume re-extracted from a different container format (PDF vs DOCX) or with cosmetic
+// whitespace/punctuation differences still hashes identically.
+export function normalizeTextForDedupe(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9一-鿿]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function splitText(text: string, page?: number): Segment[] {

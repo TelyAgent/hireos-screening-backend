@@ -57,13 +57,34 @@ export class IntakeController {
     @Req() req: { identity: Identity },
     @UploadedFiles() files: MulterFile[],
     @Headers('x-import-channel') channel: 'manual_upload' | 'email' | 'folder' | 'api' | undefined,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.imports.createBatch(req.identity, files, channel || 'manual_upload');
+    return this.imports.createBatch(req.identity, files, channel || 'manual_upload', idempotencyKey);
   }
 
   @Get('imports/:id')
   getImport(@Req() req: { identity: Identity }, @Param('id') id: string) {
     return this.imports.getBatch(req.identity.workspaceId, id);
+  }
+
+  @Post('imports/:id/retry')
+  retryImport(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.imports.retryBatch(req.identity, id);
+  }
+
+  @Post('import-items/:id/retry')
+  retryImportItem(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.imports.retryItem(req.identity, id);
+  }
+
+  @Post('imports/:id/cancel')
+  cancelImport(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.imports.cancelBatch(req.identity, id);
+  }
+
+  @Get('imports/:id/activity')
+  importActivity(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.imports.activity(req.identity.workspaceId, id);
   }
 
   @Get('intake')

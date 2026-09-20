@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../persistence/prisma.service';
-import { displayNameFromFileName } from '../intake/imports.service';
+import { displayNameFromFileName, ImportsService } from '../intake/imports.service';
 import type { Identity } from '../auth/workspace.guard';
 import type { DuplicateResolutionOutcome } from './duplicates.types';
 import { ProfilesService } from '../profiles/profiles.service';
@@ -10,6 +10,7 @@ export class DuplicatesService {
   constructor(
     private readonly db: PrismaService,
     private readonly profiles: ProfilesService,
+    private readonly imports: ImportsService,
   ) {}
 
   async get(identity: Identity, id: string) {
@@ -72,15 +73,34 @@ export class DuplicatesService {
       include: { material: true },
     });
     if (!check) throw new NotFoundException({ code: 'NOT_FOUND' });
-    if (outcome === 'defer') {
-      await this.db.duplicateCheck.update({
-        where: { id },
-        data: { status: 'open', resolutionOutcome: outcome, resolutionNote: note || 'Deferred for more information.' },
+
+    if (outcome === 'defer' || outcome === 'needs_more_information') {
+      // A compare-and-set claim, same idiom the import job queue uses for its lease
+      // claims: only a check that is still "open" can be touched, so a decision that
+      // already landed (from this call or a concurrent one) can never be silently undone.
+      const claim = await this.db.duplicateCheck.updateMany({
+        where: { id, workspaceId: identity.workspaceId, status: { not: 'resolved' } },
+        data: {
+          status: 'open',
+          resolutionOutcome: outcome,
+          resolutionNote: note || (outcome === 'needs_more_information'
+            ? 'Reviewer needs more information before deciding.'
+            : 'Deferred for more information.'),
+        },
       });
+      if (claim.count !== 1) throw new BadRequestException({ code: 'ALREADY_RESOLVED' });
       return this.get(identity, id);
     }
 
-    await this.db.$transaction(async (tx) => {
+    const { resolvedCandidateId, closedBatch } = await this.db.$transaction(async (tx) => {
+      let resolvedCandidateId: string | null = null;
+      let closedBatch: { batchId: string; operationId: string | null } | null = null;
+      const claim = await tx.duplicateCheck.updateMany({
+        where: { id, workspaceId: identity.workspaceId, status: { not: 'resolved' } },
+        data: { status: 'resolved', resolutionOutcome: outcome, resolvedBy: identity.actorId, resolvedAt: new Date() },
+      });
+      if (claim.count !== 1) throw new BadRequestException({ code: 'ALREADY_RESOLVED' });
+
       if (outcome === 'same_person_new_version') {
         if (!check.existingCandidateId || check.material.readStatus !== 'available') {
           throw new BadRequestException({ code: 'CANDIDATE_OR_MATERIAL_NOT_READY' });
@@ -106,6 +126,17 @@ export class DuplicatesService {
         await tx.candidateSource.updateMany({
           where: { materialId: check.materialId },
           data: { candidateId: check.existingCandidateId },
+        });
+        resolvedCandidateId = check.existingCandidateId;
+        await tx.auditRecord.create({
+          data: {
+            workspaceId: identity.workspaceId,
+            actorId: identity.actorId,
+            action: 'duplicate_resolved_same_person',
+            objectType: 'Candidate',
+            objectId: check.existingCandidateId,
+            payload: { duplicateCheckId: id, materialId: check.materialId, note: note || null },
+          },
         });
       } else if (outcome === 'different_person') {
         const candidate = await tx.candidate.create({
@@ -136,18 +167,73 @@ export class DuplicatesService {
           where: { materialId: check.materialId },
           data: { candidateId: candidate.id },
         });
+        resolvedCandidateId = candidate.id;
+        await tx.auditRecord.create({
+          data: {
+            workspaceId: identity.workspaceId,
+            actorId: identity.actorId,
+            action: 'duplicate_resolved_different_person',
+            objectType: 'Candidate',
+            objectId: candidate.id,
+            payload: { duplicateCheckId: id, materialId: check.materialId, previouslySuspectedCandidateId: check.existingCandidateId, note: note || null },
+          },
+        });
+      } else if (outcome === 'reuse_file') {
+        if (!check.existingCandidateId) throw new BadRequestException({ code: 'CANDIDATE_NOT_READY' });
+        // No new resume version: the reviewer confirmed this content is already covered
+        // by the existing candidate's file. Only re-point provenance so the newly
+        // uploaded material's source is attributed correctly.
+        await tx.candidateSource.updateMany({
+          where: { materialId: check.materialId },
+          data: { candidateId: check.existingCandidateId },
+        });
+        resolvedCandidateId = check.existingCandidateId;
+        await tx.auditRecord.create({
+          data: {
+            workspaceId: identity.workspaceId,
+            actorId: identity.actorId,
+            action: 'duplicate_resolved_reuse_file',
+            objectType: 'Candidate',
+            objectId: check.existingCandidateId,
+            payload: { duplicateCheckId: id, materialId: check.materialId, note: note || null },
+          },
+        });
       }
+
       await tx.duplicateCheck.update({
         where: { id },
-        data: {
-          status: 'resolved',
-          resolutionOutcome: outcome,
-          resolutionNote: note || defaultResolutionNote(outcome),
-          resolvedBy: identity.actorId,
-          resolvedAt: new Date(),
-        },
+        data: { resolutionNote: note || defaultResolutionNote(outcome) },
       });
+
+      // Close the loop: the ImportItem that raised this review has been parked in
+      // needs_review since upload, and the HumanTask that asked for a decision is still
+      // open. Both would otherwise stay stuck forever -- nothing else in the system ever
+      // revisits them once a duplicate review is created.
+      const item = await tx.importItem.findFirst({
+        where: { duplicateReviewId: id, workspaceId: identity.workspaceId },
+        include: { batch: true },
+      });
+      if (item) {
+        await tx.importItem.update({
+          where: { id: item.id },
+          data: {
+            stage: 'profile_processing',
+            status: 'completed',
+            outcome: `duplicate_resolved_${outcome}`,
+            candidateId: resolvedCandidateId,
+            businessConsumeStatus: 'completed',
+            completedAt: new Date(),
+          },
+        });
+        closedBatch = { batchId: item.batchId, operationId: item.batch.operationId };
+      }
+      await tx.humanTask.updateMany({
+        where: { duplicateReviewId: id, workspaceId: identity.workspaceId, status: { notIn: ['completed', 'cancelled'] } },
+        data: { status: 'completed', completedAt: new Date(), completionRef: id },
+      });
+      return { resolvedCandidateId, closedBatch };
     });
+
     if (outcome === 'same_person_new_version' || outcome === 'different_person') {
       const version = await this.db.resumeVersion.findUnique({
         where: { materialId: check.materialId },
@@ -157,11 +243,17 @@ export class DuplicatesService {
         await this.profiles.enqueue(identity.workspaceId, version.candidateId, version.id, check.materialId);
       }
     }
+    if (closedBatch) {
+      // The batch's rolled-up status was computed while this item was still
+      // "needs_review"; refresh it now that the review has a real outcome, otherwise the
+      // batch view keeps showing "partial"/"processing" after everything is actually done.
+      await this.imports.finalizeBatch(identity.workspaceId, identity.actorId, closedBatch.operationId || '', closedBatch.batchId);
+    }
     return this.get(identity, id);
   }
 }
 
-function defaultResolutionNote(outcome: Exclude<DuplicateResolutionOutcome, 'defer'>) {
+function defaultResolutionNote(outcome: Exclude<DuplicateResolutionOutcome, 'defer' | 'needs_more_information'>) {
   if (outcome === 'reuse_file') return 'Existing file content was reused; this source remains in import history.';
   if (outcome === 'same_person_new_version') return 'Saved as a new resume version for the existing candidate.';
   return 'Created a separate candidate. No identities were merged.';

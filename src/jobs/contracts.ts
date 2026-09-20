@@ -8,6 +8,14 @@ export const createJobSchema = z.object({
   assessmentRequired: z.boolean().optional(),
 }).strict();
 
+export const importJobSchema = z.object({
+  sourceFileName: z.string().trim().min(1).max(500).optional(),
+  sourceText: z.string().trim().min(1).max(50000),
+  title: z.string().trim().min(1).max(200).optional(),
+  team: z.string().trim().max(200).optional(),
+  assessmentRequired: z.boolean().optional(),
+}).strict();
+
 export const criteriaSchema = z.object({
   requirements: z.array(z.object({
     id: z.string().min(1),

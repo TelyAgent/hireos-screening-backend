@@ -63,6 +63,51 @@ criteria. Local discovery only creates `PreLinkMatchEvaluation` and
 `CandidateJobRecommendation`; it never creates an `Application`. External AI
 is not claimed until a configured adapter is added.
 
+### JD/Core criteria integration
+
+The existing Screening criteria endpoints remain the frontend contract, but
+they can delegate authoritative role criteria to the JD and Core Record
+services:
+
+- `CORE_RECORD_MODE=remote` enables the remote criteria facade;
+- `JD_BASE_URL` points to the JD backend, for example
+  `http://127.0.0.1:3005/api`;
+- edits update the current JD draft and its Core role definition version;
+- confirmation marks the Core role version as confirmed;
+- reopening creates a new draft role version;
+- Screening keeps a local `JobCriteriaVersion` projection for compatibility
+  with its matching and evaluation modules.
+
+The frontend does not need to change. Set `CORE_RECORD_MODE=mock` to keep the
+existing local-only behavior during isolated development.
+
+### Reusable JD import
+
+`POST /api/jobs/import` accepts:
+
+```json
+{
+  "sourceFileName": "role.txt",
+  "sourceText": "职位名称：..."
+}
+```
+
+The import is idempotent for the same workspace and source text. It parses the
+source into a draft role definition, creates the Core Job, creates the JD
+draft, and keeps the original text in Screening for provenance. The same
+method is used by the existing `POST /api/jobs` create flow when `jdText` is
+provided.
+
+For local sample data:
+
+```sh
+npm run jobs:import:samples
+```
+
+Imported roles intentionally remain `draft` until a human confirms the
+criteria from the existing Job Criteria page. This preserves the JD contract:
+source ingestion is not the same fact as approval or activation.
+
 ## Linking and human tasks
 
 Phase 3 adds the human-controlled transition from a recommendation to a
