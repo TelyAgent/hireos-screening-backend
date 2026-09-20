@@ -1,0 +1,69 @@
+import { Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { WorkspaceGuard, type Identity } from '../auth/workspace.guard';
+import { SettingsService } from './settings.service';
+
+@Controller()
+@UseGuards(WorkspaceGuard)
+export class SettingsController {
+  constructor(private readonly settings: SettingsService) {}
+
+  @Get('connections')
+  listConnections(@Req() req: { identity: Identity }) {
+    return this.settings.listConnections(req.identity);
+  }
+
+  @Post('connections/:id/read')
+  readConnection(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.readConnection(req.identity, id);
+  }
+
+  @Post('connections/:id/reconnect')
+  reconnectConnection(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.reconnectConnection(req.identity, id);
+  }
+
+  @Post('connections/:id/pause')
+  pauseConnection(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.pauseConnection(req.identity, id);
+  }
+
+  @Get('activity')
+  listActivity(@Req() req: { identity: Identity }) {
+    return this.settings.listActivity(req.identity);
+  }
+
+  @Get('audit')
+  listAudit(@Req() req: { identity: Identity }) {
+    return this.settings.listActivity(req.identity);
+  }
+
+  @Get('preferences')
+  getPreferences(@Req() req: { identity: Identity }) {
+    return this.settings.getPreferences(req.identity);
+  }
+
+  @Post('preferences/proposals/:id/activate')
+  activateProposal(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.activateProposal(req.identity, id);
+  }
+
+  @Post('preferences/proposals/:id/reject')
+  rejectProposal(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.rejectProposal(req.identity, id);
+  }
+
+  @Post('preferences/versions/:id/rollback')
+  rollbackPreference(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.rollbackPreference(req.identity, id);
+  }
+
+  @Get('ai-models')
+  getAiModels(@Req() req: { identity: Identity }) {
+    return this.settings.getAiModels(req.identity);
+  }
+
+  @Get('ai-models/activity')
+  getAiModelActivity(@Req() req: { identity: Identity }) {
+    return this.settings.getAiModelActivity(req.identity);
+  }
+}

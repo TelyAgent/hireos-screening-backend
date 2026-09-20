@@ -1,0 +1,806 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Foundational material record. Domain-specific Candidate/Profile entities are
+// added in the Intake and Library phases.
+model Material {
+  id               String            @id @default(uuid())
+  workspaceId      String
+  name             String
+  mime             String
+  size             Int
+  hash             String
+  storageKey       String
+  text             String            @db.Text
+  segments         Json
+  readStatus       String            @default("pending")
+  errorCode        String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  processingJobs   ProcessingJob[]
+  resumeVersion    ResumeVersion?
+  candidateSources CandidateSource[]
+  duplicateChecks  DuplicateCheck[]
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, hash])
+}
+
+model Candidate {
+  id              String            @id @default(uuid())
+  workspaceId     String
+  displayName     String
+  email           String?
+  phone           String?
+  identityStatus  String            @default("provisional")
+  ownerId         String
+  retention       String            @default("standard-24mo")
+  libraryStatus   String            @default("available")
+  lastMatchedAt   DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  resumeVersions  ResumeVersion[]
+  profiles        CandidateProfile[]
+  processingJobs  ProcessingJob[]
+  discoveryRuns   JobDiscoveryRun[]
+  prelinkEvaluations PreLinkMatchEvaluation[]
+  recommendations CandidateJobRecommendation[]
+  applications   Application[]
+  tasks          HumanTask[]
+  linkDecisions  LinkDecision[]
+  sources         CandidateSource[]
+  libraryEntry    LibraryEntry?
+  duplicateChecks DuplicateCheck[]  @relation("ExistingCandidate")
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, displayName])
+}
+
+model Job {
+  id               String       @id @default(uuid())
+  workspaceId      String
+  title            String
+  team             String
+  location         String
+  employmentType   String
+  seniority        String
+  status           String       @default("open")
+  jdText           String?      @db.Text
+  criteriaStatus   String       @default("draft")
+  criteriaVersion  Int          @default(0)
+  confirmedBy      String?
+  confirmedAt      DateTime?
+  openings         Int          @default(1)
+  applicantCount   Int          @default(0)
+  assessmentRequired Boolean    @default(false)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  criteriaVersions JobCriteriaVersion[]
+  discoveryRuns    JobDiscoveryRun[]
+  prelinkEvaluations PreLinkMatchEvaluation[]
+  recommendations CandidateJobRecommendation[]
+  applications   Application[]
+  tasks          HumanTask[]
+  linkDecisions  LinkDecision[]
+  comparisonSets ComparisonSet[]
+  rankingSnapshots RankingSnapshot[]
+  decisions      ScreeningDecision[]
+  packages       HandoffPackage[]
+
+  @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, title])
+}
+
+model JobCriteriaVersion {
+  id          String   @id @default(uuid())
+  workspaceId String
+  jobId       String
+  version     Int
+  status      String   @default("draft")
+  requirements Json
+  dimensions   Json
+  confirmedBy String?
+  confirmedAt DateTime?
+  createdAt   DateTime @default(now())
+  job         Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, version])
+  @@index([workspaceId, jobId, createdAt])
+}
+
+model ResumeVersion {
+  id          String    @id @default(uuid())
+  workspaceId String
+  candidateId String
+  materialId  String    @unique
+  version     Int
+  source      String    @default("manual_upload")
+  parseStatus String
+  isLatest    Boolean   @default(true)
+  uploadedAt  DateTime  @default(now())
+  changeNote  String?
+  profiles    CandidateProfile[]
+  processingJobs ProcessingJob[]
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  material    Material  @relation(fields: [materialId], references: [id])
+
+  @@unique([candidateId, version])
+  @@index([workspaceId, candidateId, uploadedAt])
+}
+
+model CandidateSource {
+  id               String     @id @default(uuid())
+  workspaceId      String
+  candidateId      String?
+  materialId       String?
+  channel          String
+  sourceRecordId   String?
+  receivedAt       DateTime
+  authorizationRef String?
+  candidate        Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  material         Material?  @relation(fields: [materialId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, receivedAt])
+  @@index([workspaceId, candidateId])
+}
+
+model LibraryEntry {
+  id          String    @id @default(uuid())
+  workspaceId String
+  candidateId String    @unique
+  status      String    @default("available")
+  ownerId     String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+}
+
+model ImportBatch {
+  id          String       @id @default(uuid())
+  workspaceId String
+  createdBy   String
+  status      String       @default("processing")
+  createdAt   DateTime     @default(now())
+  items       ImportItem[]
+
+  @@index([workspaceId, createdAt])
+}
+
+model ImportItem {
+  id                String      @id @default(uuid())
+  batchId           String
+  workspaceId       String
+  materialId        String?
+  fileName          String
+  sizeKB            Int
+  outcome           String
+  candidateId       String?
+  duplicateReviewId String?
+  createdAt         DateTime    @default(now())
+  batch             ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+  @@index([batchId])
+}
+
+model DuplicateCheck {
+  id                  String     @id @default(uuid())
+  workspaceId         String
+  materialId          String
+  kind                String
+  status              String     @default("open")
+  existingCandidateId String?
+  basis               Json
+  resolutionOutcome   String?
+  resolutionNote      String?
+  resolvedBy          String?
+  resolvedAt          DateTime?
+  createdAt           DateTime   @default(now())
+  material            Material   @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  existingCandidate   Candidate? @relation("ExistingCandidate", fields: [existingCandidateId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, materialId])
+}
+
+// Durable queue primitive shared by future parsing, matching, screening and
+// delivery workers. The lease fields support compare-and-set recovery.
+model ProcessingJob {
+  id          String    @id @default(uuid())
+  workspaceId String
+  type        String
+  status      String    @default("queued")
+  attempt     Int       @default(0)
+  leaseToken  String?
+  leaseUntil  DateTime?
+  nextRunAt   DateTime  @default(now())
+  input       Json
+  result      Json?
+  errorCode   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  materialId  String?
+  candidateId String?
+  resumeVersionId String?
+  material    Material? @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  candidate   Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  resumeVersion ResumeVersion? @relation(fields: [resumeVersionId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextRunAt])
+  @@index([workspaceId, createdAt])
+  @@index([materialId])
+  @@index([candidateId])
+  @@index([resumeVersionId])
+}
+
+model CandidateProfile {
+  id                      String    @id @default(uuid())
+  workspaceId             String
+  candidateId             String
+  resumeVersionId         String?
+  version                 Int
+  parseStatus             String    @default("pending")
+  dataStatus              String    @default("partial")
+  parserVersion           String?
+  displayName             String
+  sourceEntries           Json
+  resumeVersionRefs       Json
+  employmentHistory       Json
+  skills                  Json
+  education               Json
+  certifications          Json
+  projects                Json
+  location                Json
+  workAuthorization       Json
+  languages               Json
+  compensationExpectation Json?
+  missingFields           Json
+  corrections             Json
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+  candidate               Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  resumeVersion           ResumeVersion? @relation(fields: [resumeVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([candidateId, version])
+  @@index([workspaceId, candidateId, createdAt])
+  @@index([workspaceId, parseStatus])
+}
+
+model JobDiscoveryRun {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  candidateId   String
+  status        String
+  reason        Json?
+  jobsScanned   Int      @default(0)
+  createdAt     DateTime @default(now())
+  completedAt   DateTime?
+  candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  recommendations CandidateJobRecommendation[]
+  evaluations   PreLinkMatchEvaluation[]
+  job           Job?     @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  jobId         String?
+
+  @@index([workspaceId, candidateId, createdAt])
+  @@index([workspaceId, status])
+}
+
+model PreLinkMatchEvaluation {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  candidateId    String
+  jobId          String
+  discoveryRunId String?
+  profileVersion Int?
+  criteriaVersion Int
+  status         String
+  overallScore   Float?
+  coverage       Float
+  rationale      String
+  gaps           Json
+  evidence       Json
+  createdAt      DateTime @default(now())
+  candidate      Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  job            Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  discoveryRun   JobDiscoveryRun? @relation(fields: [discoveryRunId], references: [id], onDelete: SetNull)
+  recommendations CandidateJobRecommendation[]
+
+  @@index([workspaceId, candidateId, jobId, createdAt])
+  @@index([workspaceId, jobId, criteriaVersion])
+}
+
+model CandidateJobRecommendation {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  candidateId    String
+  jobId          String
+  prelinkEvaluationId String
+  discoveryRunId  String?
+  status         String   @default("proposed")
+  confidence     Float
+  rationale      String
+  gaps           Json
+  proposalSource String   @default("manual")
+  applicationRef String?
+  staleReason    String?
+  createdAt      DateTime @default(now())
+  candidate      Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  job            Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  prelinkEvaluation PreLinkMatchEvaluation @relation(fields: [prelinkEvaluationId], references: [id], onDelete: Cascade)
+  discoveryRun    JobDiscoveryRun? @relation(fields: [discoveryRunId], references: [id], onDelete: SetNull)
+  application     Application? @relation(fields: [applicationRef], references: [id], onDelete: SetNull)
+  linkDecisions   LinkDecision[]
+
+  @@unique([candidateId, jobId, prelinkEvaluationId])
+  @@index([workspaceId, candidateId, status, createdAt])
+  @@index([workspaceId, jobId, status, createdAt])
+}
+
+model Application {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  candidateId    String
+  jobId          String
+  cycleId        String   @default("cycle-1")
+  status         String   @default("active")
+  screeningStatus String  @default("not_started")
+  assessmentStatus String @default("not_administered")
+  origin         String   @default("sourced")
+  linkedAt       DateTime @default(now())
+  linkedBy       String
+  linkReason     String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  candidate      Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  recommendations CandidateJobRecommendation[]
+  linkDecisions  LinkDecision[]
+  tasks          HumanTask[]
+  screeningSessions ScreeningSession[]
+  evaluations    ScreeningEvaluation[]
+  concerns       ScreeningConcern[]
+  verificationItems VerificationItem[]
+  humanAssessments HumanAssessment[]
+  comparisonMembers ComparisonMember[]
+  decisions      ScreeningDecision[]
+  packages       HandoffPackage[]
+
+  @@unique([workspaceId, candidateId, jobId, cycleId])
+  @@index([workspaceId, jobId, status])
+  @@index([workspaceId, candidateId, status])
+}
+
+model LinkDecision {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  candidateId    String
+  jobId          String
+  recommendationId String?
+  applicationId  String?
+  action         String
+  reason         String
+  actorId        String
+  inputManifest  Json
+  createdAt      DateTime @default(now())
+  candidate      Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  recommendation CandidateJobRecommendation? @relation(fields: [recommendationId], references: [id], onDelete: SetNull)
+  application    Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, candidateId, jobId, createdAt])
+  @@index([workspaceId, recommendationId])
+}
+
+model HumanTask {
+  id               String   @id @default(uuid())
+  workspaceId      String
+  sourceModule     String
+  taskType         String
+  title            String
+  subjectLabel     String
+  requiredAction   String
+  completionRule   Json
+  candidateId      String?
+  jobId            String?
+  applicationId    String?
+  recommendationId String?
+  assigneeId       String?
+  queue            String?
+  priority         String   @default("normal")
+  status           String   @default("open")
+  sourceVersion    Int      @default(1)
+  needsRefresh     Boolean  @default(false)
+  linkRoute        String
+  waitingReason    String?
+  resumeAt         DateTime?
+  dueAt            DateTime?
+  completionRef    String?
+  createdAt        DateTime @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+  candidate        Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  job              Job? @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  application      Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, assigneeId, status])
+  @@index([workspaceId, applicationId])
+}
+
+model ScreeningSession {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  applicationId String
+  purpose       String   @default("initial")
+  status        String   @default("open")
+  ownerId       String
+  createdAt     DateTime @default(now())
+  closedAt      DateTime?
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluations   ScreeningEvaluation[]
+
+  @@index([workspaceId, applicationId, createdAt])
+}
+
+model ScreeningEvaluation {
+  id               String   @id @default(uuid())
+  workspaceId      String
+  applicationId    String
+  sessionId        String
+  version          Int
+  status           String   @default("completed")
+  evaluationMode   String   @default("manual")
+  aiStatus         String   @default("not_requested")
+  inputManifest    Json
+  eligibilityStatus String?
+  eligibilityResults Json
+  overallScore     Float?
+  coverage         Float?
+  confidence       Float?
+  evaluationStatus String
+  strengths        Json
+  missingInformation Json
+  recommendation  Json?
+  modelVersion    String?
+  freshness        String   @default("current")
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+  session          ScreeningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  application      Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  dimensionScores  DimensionScore[]
+  evidenceItems    EvidenceItem[]
+  concerns         ScreeningConcern[]
+  verificationItems VerificationItem[]
+  humanAssessments HumanAssessment[]
+  decisions        ScreeningDecision[]
+
+  @@unique([applicationId, version])
+  @@index([workspaceId, applicationId, createdAt])
+  @@index([workspaceId, freshness])
+}
+
+model DimensionScore {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  evaluationId   String
+  dimensionId    String
+  name           String
+  weight         Float
+  status         String
+  score          Float?
+  confidence     Float?
+  reason         String
+  supportingRefs Json
+  counterRefs    Json
+  evaluation     ScreeningEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@unique([evaluationId, dimensionId])
+  @@index([workspaceId, evaluationId])
+}
+
+model EvidenceItem {
+  id           String   @id @default(uuid())
+  workspaceId  String
+  evaluationId String
+  candidateId  String
+  materialId   String?
+  kind         String
+  sourceLabel  String
+  statement    String
+  locator      Json
+  verification String   @default("unverified")
+  confidence   Float?
+  availability String   @default("available")
+  restrictedReason String?
+  evaluation   ScreeningEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, evaluationId])
+  @@index([workspaceId, candidateId])
+}
+
+model ScreeningConcern {
+  id              String   @id @default(uuid())
+  workspaceId     String
+  applicationId   String
+  evaluationId    String
+  type            String
+  title           String
+  severity        String
+  confidence      Float?
+  basis           String
+  status          String   @default("open")
+  requirementIds  Json
+  verificationItemIds Json
+  restricted      Boolean  @default(false)
+  resolution      String?
+  application     Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluation      ScreeningEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, applicationId, status])
+  @@index([workspaceId, evaluationId])
+}
+
+model VerificationItem {
+  id              String   @id @default(uuid())
+  workspaceId     String
+  applicationId   String
+  evaluationId    String
+  question        String
+  method          String
+  targetStage     String
+  priority        String
+  status          String   @default("open")
+  acceptance      String
+  ownerId         String?
+  outcome         String?
+  resolvedBy      String?
+  resolvedAt      DateTime?
+  application     Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluation      ScreeningEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, applicationId, status])
+}
+
+model HumanAssessment {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  applicationId  String
+  evaluationId   String
+  dimensionId    String
+  dimensionName  String
+  score          Float
+  reason         String
+  byActorId      String
+  createdAt      DateTime @default(now())
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluation     ScreeningEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@unique([evaluationId, dimensionId])
+  @@index([workspaceId, applicationId])
+}
+
+model ComparisonSet {
+  id            String   @id @default(uuid())
+  workspaceId   String
+  jobId         String
+  purpose       String
+  ownerId       String
+  collaborators Json
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  job           Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  members       ComparisonMember[]
+  snapshots     ComparisonSnapshot[]
+  annotations   ComparisonAnnotation[]
+  rankingSnapshots RankingSnapshot[]
+
+  @@index([workspaceId, jobId, updatedAt])
+}
+
+model ComparisonMember {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  comparisonSetId String
+  applicationId  String
+  addedAt        DateTime @default(now())
+  comparisonSet  ComparisonSet @relation(fields: [comparisonSetId], references: [id], onDelete: Cascade)
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([comparisonSetId, applicationId])
+  @@index([workspaceId, applicationId])
+}
+
+model ComparisonSnapshot {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  comparisonSetId String
+  version        Int
+  mode           String
+  freshness      String   @default("current")
+  note           String
+  changesSinceLast Json
+  generatedAt    DateTime @default(now())
+  comparisonSet  ComparisonSet @relation(fields: [comparisonSetId], references: [id], onDelete: Cascade)
+  rankingSnapshot RankingSnapshot?
+
+  @@unique([comparisonSetId, version])
+  @@index([workspaceId, comparisonSetId, generatedAt])
+}
+
+model RankingSnapshot {
+  id                  String   @id @default(uuid())
+  workspaceId         String
+  jobId               String
+  comparisonSetId     String?
+  comparisonSnapshotId String   @unique
+  criteriaVersion     Int
+  baselineKey         String
+  entries              Json
+  createdAt            DateTime @default(now())
+  job                 Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  comparisonSet       ComparisonSet? @relation(fields: [comparisonSetId], references: [id], onDelete: SetNull)
+  comparisonSnapshot  ComparisonSnapshot @relation(fields: [comparisonSnapshotId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, jobId, criteriaVersion, createdAt])
+}
+
+model ComparisonAnnotation {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  comparisonSetId String
+  targetId       String
+  body           String
+  authorId       String
+  createdAt      DateTime @default(now())
+  comparisonSet  ComparisonSet @relation(fields: [comparisonSetId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, comparisonSetId, createdAt])
+}
+
+model ScreeningDecision {
+  id              String   @id @default(uuid())
+  workspaceId     String
+  applicationId   String
+  jobId           String
+  evaluationId    String?
+  outcome         String
+  reason          String
+  actorId         String
+  status          String   @default("approved")
+  overrideAi      Boolean  @default(false)
+  nextStepTarget  String   @default("record_only")
+  exceptionRef    String?
+  policyRef       String?
+  createdAt       DateTime @default(now())
+  application     Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  job             Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  evaluation      ScreeningEvaluation? @relation(fields: [evaluationId], references: [id], onDelete: SetNull)
+  exceptionApprovals DecisionExceptionApproval[]
+  packages        HandoffPackage[]
+
+  @@index([workspaceId, applicationId, createdAt])
+  @@index([workspaceId, jobId, status])
+}
+
+model DecisionExceptionApproval {
+  id           String   @id @default(uuid())
+  workspaceId  String
+  decisionId   String
+  role         String
+  actorId      String
+  status       String   @default("approved")
+  reason       String
+  createdAt    DateTime @default(now())
+  decision     ScreeningDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, decisionId])
+}
+
+model HandoffPackage {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  applicationId  String
+  jobId          String
+  decisionId     String?
+  kind           String
+  transport      String?
+  targetLabel    String
+  reviewStatus   String?
+  status         String   @default("package_ready")
+  manifest       Json
+  payload        Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  job            Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  decision       ScreeningDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+  attempts       DeliveryAttempt[]
+
+  @@index([workspaceId, applicationId, createdAt])
+  @@index([workspaceId, status, createdAt])
+}
+
+model DeliveryAttempt {
+  id          String   @id @default(uuid())
+  workspaceId String
+  packageId   String
+  attemptNo   Int
+  status      String   @default("prepared")
+  transport   String?
+  targetLabel String
+  history     Json
+  errorCode   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  package     HandoffPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  receipt     Receipt?
+
+  @@unique([packageId, attemptNo])
+  @@index([workspaceId, status, createdAt])
+}
+
+model Receipt {
+  id             String   @id @default(uuid())
+  workspaceId    String
+  deliveryAttemptId String @unique
+  status         String
+  externalRef    String?
+  receivedAt     DateTime?
+  importedAt     DateTime?
+  detail         Json?
+  deliveryAttempt DeliveryAttempt @relation(fields: [deliveryAttemptId], references: [id], onDelete: Cascade)
+}
+
+model AuditRecord {
+  id          String   @id @default(uuid())
+  workspaceId String
+  actorId     String
+  action      String
+  objectType  String
+  objectId    String
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, objectType, objectId])
+}
+
+model SourceConnection {
+  id          String   @id
+  workspaceId String
+  kind        String
+  name        String
+  account     String
+  status      String   @default("connected")
+  lastReadAt  DateTime?
+  scope       String
+  config      Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([workspaceId, kind, status])
+  @@index([workspaceId, updatedAt])
+}
+
+model WorkspaceSetting {
+  id          String   @id @default(uuid())
+  workspaceId String
+  kind        String
+  key         String
+  version     Int      @default(1)
+  payload     Json
+  updatedBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([workspaceId, kind, key])
+  @@index([workspaceId, kind, updatedAt])
+}
