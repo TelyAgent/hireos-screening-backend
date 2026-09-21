@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Req, UseGuards } from '@nestjs/common';
 import { WorkspaceGuard, type Identity } from '../auth/workspace.guard';
 import { SettingsService } from './settings.service';
 
@@ -65,5 +65,47 @@ export class SettingsController {
   @Get('ai-models/activity')
   getAiModelActivity(@Req() req: { identity: Identity }) {
     return this.settings.getAiModelActivity(req.identity);
+  }
+
+  @Get('settings/corporate-mailboxes')
+  listCorporateMailboxes(@Req() req: { identity: Identity }) {
+    return this.settings.listCorporateMailboxes(req.identity);
+  }
+
+  @Get('settings/corporate-mailboxes/:id')
+  getCorporateMailbox(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.getCorporateMailbox(req.identity, id);
+  }
+
+  @Post('settings/corporate-mailboxes')
+  createCorporateMailbox(@Req() req: { identity: Identity }, @Body() body: unknown) {
+    return this.settings.createCorporateMailbox(req.identity, body);
+  }
+
+  @Put('settings/corporate-mailboxes/:id')
+  updateCorporateMailbox(@Req() req: { identity: Identity }, @Param('id') id: string, @Body() body: unknown) {
+    return this.settings.updateCorporateMailbox(req.identity, id, body);
+  }
+
+  @Delete('settings/corporate-mailboxes/:id')
+  deleteCorporateMailbox(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.deleteCorporateMailbox(req.identity, id);
+  }
+
+  @Post('settings/corporate-mailboxes/:id/enabled')
+  setCorporateMailboxEnabled(@Req() req: { identity: Identity }, @Param('id') id: string, @Body() body: { enabled: boolean }) {
+    return this.settings.setCorporateMailboxEnabled(req.identity, id, Boolean(body?.enabled));
+  }
+
+  // No :id here -- this also has to work for a brand-new account that hasn't
+  // been created yet, which is exactly when "test before you save" matters most.
+  @Post('settings/corporate-mailboxes/test')
+  testCorporateMailbox(@Req() req: { identity: Identity }, @Body() body: unknown) {
+    return this.settings.testCorporateMailbox(req.identity, body);
+  }
+
+  @Post('settings/corporate-mailboxes/:id/sync')
+  syncCorporateMailbox(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.syncCorporateMailbox(req.identity, id);
   }
 }
