@@ -5,6 +5,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
 import { ProfileParserService } from './profile-parser.service';
+import { AiProfileParserService } from './ai-profile-parser.service';
 import { DiscoveryService } from '../discovery/discovery.service';
 
 @Injectable()
@@ -15,6 +16,7 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly db: PrismaService,
     private readonly parser: ProfileParserService,
+    private readonly aiParser: AiProfileParserService,
     private readonly discovery: DiscoveryService,
   ) {}
 
@@ -196,7 +198,14 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
       if (!material || !candidate || material.readStatus !== 'available') {
         throw new Error('SOURCE_MATERIAL_NOT_READY');
       }
-      const parsed = this.parser.parse(material.id, asSegments(material.segments), candidate.displayName);
+      // AI is authoritative when configured -- the local parser is a fixed English tech
+      // keyword list that returns near-empty profiles for Chinese or non-engineering
+      // resumes even though parseStatus says "succeeded". A genuine AI failure must
+      // surface as a failed job (retryable), not silently fall back to that weak parser
+      // and look successful while extracting almost nothing.
+      const parsed = this.aiParser.isConfigured()
+        ? await this.parseWithAi(material, candidate.displayName)
+        : this.parseLocally(material, candidate.displayName);
       const profile = await this.db.$transaction(async (tx) => {
         const latest = await tx.candidateProfile.findFirst({
           where: { candidateId: candidate.id },
@@ -211,7 +220,7 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
             version: (latest?.version || 0) + 1,
             parseStatus: 'succeeded',
             dataStatus: parsed.missingFields.length ? 'partial' : 'complete',
-            parserVersion: 'local-resume-parser-v1',
+            parserVersion: parsed.parserVersion,
             displayName: parsed.displayName,
             sourceEntries: parsed.sourceEntries,
             resumeVersionRefs: [job.resumeVersionId],
@@ -243,7 +252,7 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
           where: { id: job.id },
           data: {
             status: 'succeeded',
-            result: { profileId: created.id, parserVersion: 'local-resume-parser-v1', dataStatus: created.dataStatus },
+            result: { profileId: created.id, parserVersion: parsed.parserVersion, dataStatus: created.dataStatus },
             leaseToken: null,
             leaseUntil: null,
           },
@@ -270,6 +279,41 @@ export class ProfilesService implements OnModuleInit, OnModuleDestroy {
         data: { parseStatus: 'failed' },
       });
     }
+  }
+
+  private parseLocally(material: { id: string; segments: unknown }, fallbackName: string) {
+    const parsed = this.parser.parse(material.id, asSegments(material.segments), fallbackName);
+    return { ...parsed, parserVersion: 'local-resume-parser-v1' as const };
+  }
+
+  private async parseWithAi(material: { id: string; text: string }, fallbackName: string) {
+    const ai = await this.aiParser.parse(material.text, fallbackName);
+    const missingFields = [
+      ...(ai.location.status === 'unknown' ? ['location'] : []),
+      ...(ai.workAuthorization.status === 'unknown' ? ['work_authorization'] : []),
+      ...(ai.employmentHistory.length ? [] : ['employment_history']),
+      ...(ai.education.length ? [] : ['education']),
+      ...(ai.compensationExpectation ? [] : ['compensation_expectation']),
+    ];
+    return {
+      displayName: ai.displayName || fallbackName,
+      email: ai.email,
+      phone: ai.phone,
+      location: ai.location,
+      workAuthorization: ai.workAuthorization,
+      skills: ai.skills,
+      languages: ai.languages,
+      employmentHistory: ai.employmentHistory,
+      education: ai.education,
+      certifications: ai.certifications,
+      projects: ai.projects,
+      compensationExpectation: ai.compensationExpectation ? { ...ai.compensationExpectation, status: 'known' as const } : null,
+      missingFields,
+      // Full-document evidence rather than the local parser's per-field line quotes -- the
+      // model reads the whole resume at once instead of matching individual lines.
+      sourceEntries: [{ sourceMaterialId: material.id, segmentId: 'ai-parsed', quote: material.text.slice(0, 500) }],
+      parserVersion: 'ai-resume-parser-v1' as const,
+    };
   }
 }
 

@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { z } from 'zod';
+import { AiCallError, callAiForJson, isAiConfigured } from '../shared/ai-json-client';
 
 const MAX_RESUME_CHARS = 8000;
 
@@ -40,15 +41,9 @@ const AiMatchResultSchema = z.object({
 });
 export type AiMatchResult = z.infer<typeof AiMatchResultSchema>;
 
-// Distinguishes "the model told us this candidate doesn't fit" from "we couldn't get an
-// answer at all" -- callers must never fold this into a no_match result (PRD: "AI失败不标
-// no_match"), since that would silently misreport an infrastructure problem as a hiring
-// judgment.
-export class AiMatchError extends Error {
-  constructor(message: string, readonly cause?: unknown) {
-    super(message);
-  }
-}
+// Re-exported so callers can keep catching a discovery-specific name; both point at the
+// same shared AiCallError from ai-json-client.
+export const AiMatchError = AiCallError;
 
 const SYSTEM_PROMPT = `You are a senior technical recruiter evaluating one candidate's resume against one job's confirmed hiring criteria.
 
@@ -77,23 +72,7 @@ export class AiMatcherService {
   constructor(private readonly config: ConfigService) {}
 
   isConfigured(): boolean {
-    return Boolean(this.baseUrl() && this.apiKey() && this.model());
-  }
-
-  private baseUrl(): string {
-    return this.config.get<string>('HIREOS_AI_BASE_URL', '').trim();
-  }
-
-  private apiKey(): string {
-    return this.config.get<string>('HIREOS_AI_API_KEY', '').trim();
-  }
-
-  private model(): string {
-    return this.config.get<string>('HIREOS_AI_MODEL', '').trim();
-  }
-
-  private timeoutMs(): number {
-    return Number(this.config.get<string>('HIREOS_AI_TIMEOUT_SECONDS', '60')) * 1000;
+    return isAiConfigured(this.config);
   }
 
   async evaluate(input: {
@@ -105,63 +84,7 @@ export class AiMatcherService {
     dimensions: JobDimensionInput[];
     resumeText: string;
   }): Promise<AiMatchResult> {
-    if (!this.isConfigured()) throw new AiMatchError('AI_NOT_CONFIGURED');
-
-    const controller = new AbortController();
-    const timeout = globalThis.setTimeout(() => controller.abort(), this.timeoutMs());
-    let response: Response;
-    try {
-      response = await globalThis.fetch(`${this.baseUrl().replace(/\/$/, '')}/chat/completions`, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey()}` },
-        body: JSON.stringify({
-          model: this.model(),
-          response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: buildPrompt(input) },
-          ],
-          // This model spends part of its completion budget on hidden reasoning tokens
-          // before it ever writes visible output -- at the default effort, a full
-          // requirements+dimensions evaluation exhausted the whole budget on reasoning
-          // and returned empty content (finish_reason: "length"). Capping effort keeps
-          // enough of the budget free for the actual JSON answer.
-          reasoning_effort: 'low',
-          max_completion_tokens: 6000,
-        }),
-      });
-    } catch (error) {
-      throw new AiMatchError(error instanceof Error ? error.message : 'AI_REQUEST_FAILED', error);
-    } finally {
-      globalThis.clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new AiMatchError(`AI_HTTP_${response.status}: ${text.slice(0, 300)}`);
-    }
-
-    const body = (await response.json().catch((error) => {
-      throw new AiMatchError('AI_INVALID_RESPONSE_BODY', error);
-    })) as { choices?: { message?: { content?: string }; finish_reason?: string }[] };
-    const choice = body.choices?.[0];
-    const content = choice?.message?.content;
-    if (!content) {
-      // "length" here means the token budget ran out (often on hidden reasoning tokens)
-      // before any visible content was written -- distinct from a genuinely empty reply.
-      throw new AiMatchError(choice?.finish_reason === 'length' ? 'AI_TRUNCATED_BEFORE_OUTPUT' : 'AI_EMPTY_RESPONSE');
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch (error) {
-      throw new AiMatchError('AI_INVALID_JSON', error);
-    }
-    const result = AiMatchResultSchema.safeParse(parsed);
-    if (!result.success) throw new AiMatchError(`AI_SCHEMA_MISMATCH: ${result.error.message}`);
-    return result.data;
+    return callAiForJson(this.config, SYSTEM_PROMPT, buildPrompt(input), AiMatchResultSchema);
   }
 }
 
