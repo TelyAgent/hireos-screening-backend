@@ -5,6 +5,7 @@ import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
 import { AiScreeningEvaluatorService } from './ai-screening-evaluator.service';
 import { AiCallError } from '../shared/ai-json-client';
+import { serializeDecision } from '../decisions/decisions.service';
 
 type DimensionInput = { id: string; name: string; weight: number; rubric: string };
 type RequirementInput = {
@@ -41,7 +42,11 @@ export class ScreeningService {
   async getDetail(identity: Identity, applicationId: string) {
     const application = await this.findApplication(identity, applicationId);
     const evaluation = await this.currentEvaluation(identity.workspaceId, applicationId);
-    return this.serializeDetail(application, evaluation);
+    const decision = await this.db.screeningDecision.findFirst({
+      where: { workspaceId: identity.workspaceId, applicationId, status: 'approved' },
+      orderBy: { createdAt: 'desc' },
+    });
+    return this.serializeDetail(application, evaluation, decision);
   }
 
   async listEvaluations(identity: Identity, applicationId: string) {
@@ -404,14 +409,14 @@ export class ScreeningService {
     };
   }
 
-  private serializeDetail(application: ApplicationInput, evaluation: EvaluationRecord | null) {
+  private serializeDetail(application: ApplicationInput, evaluation: EvaluationRecord | null, decision: unknown | null) {
     return {
       application: serializeApplication(application),
       evaluation: evaluation ? serializeEvaluation(evaluation) : null,
       concerns: evaluation?.concerns.map(serializeConcern) || [],
       verificationItems: evaluation?.verificationItems.map(serializeVerificationItem) || [],
       humanAssessments: evaluation?.humanAssessments.map(serializeHumanAssessment) || [],
-      decision: null,
+      decision: decision ? serializeDecision(decision) : null,
     };
   }
 

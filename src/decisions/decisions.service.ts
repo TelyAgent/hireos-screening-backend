@@ -49,6 +49,10 @@ export class DecisionsService {
       orderBy: { createdAt: 'desc' },
     });
     if (existing) {
+      // Belt-and-suspenders: if an earlier run recorded the decision but this
+      // step never ran (e.g. deployed after the decision was made), close the
+      // task now rather than leaving it stuck open forever.
+      await this.completeScreeningTask(identity, applicationId, existing.id);
       return this.serializeDecisionResult(existing, await this.latestPackage(identity.workspaceId, applicationId));
     }
     const decision = await this.db.$transaction(async (tx) => {
@@ -88,6 +92,12 @@ export class DecisionsService {
           objectId: created.id,
           payload: json({ applicationId, evaluationId: currentEvaluation?.id || null, outcome: raw.outcome, nextStepTarget: raw.nextStepTarget }),
         },
+      });
+      // Recording a decision *is* what "screening_review" was waiting on -- close
+      // the loop here so the task never has to be marked done by hand.
+      await tx.humanTask.updateMany({
+        where: { workspaceId: identity.workspaceId, applicationId, taskType: 'screening_review', status: { notIn: ['completed', 'cancelled'] } },
+        data: { status: 'completed', completedAt: new Date(), completionRef: created.id },
       });
       return created;
     });
@@ -190,6 +200,13 @@ export class DecisionsService {
     return serializePackage(created);
   }
 
+  private async completeScreeningTask(identity: Identity, applicationId: string, decisionId: string) {
+    await this.db.humanTask.updateMany({
+      where: { workspaceId: identity.workspaceId, applicationId, taskType: 'screening_review', status: { notIn: ['completed', 'cancelled'] } },
+      data: { status: 'completed', completedAt: new Date(), completionRef: decisionId },
+    });
+  }
+
   private async latestPackage(workspaceId: string, applicationId: string) {
     return this.db.handoffPackage.findFirst({
       where: { workspaceId, applicationId },
@@ -208,7 +225,7 @@ export class DecisionsService {
   }
 }
 
-function serializeDecision(decision: any) {
+export function serializeDecision(decision: any) {
   return {
     id: decision.id,
     applicationId: decision.applicationId,

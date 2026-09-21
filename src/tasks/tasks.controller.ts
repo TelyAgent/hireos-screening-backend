@@ -8,8 +8,8 @@ export class TasksController {
   constructor(private readonly tasks: TasksService) {}
 
   @Get()
-  list(@Req() req: { identity: Identity }, @Query('scope') scope?: 'mine' | 'queue') {
-    return this.tasks.list(req.identity, scope);
+  list(@Req() req: { identity: Identity }, @Query('scope') scope?: 'mine' | 'queue', @Query('applicationId') applicationId?: string) {
+    return this.tasks.list(req.identity, scope, applicationId);
   }
 
   @Post(':id/claim')

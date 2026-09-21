@@ -6,11 +6,12 @@ import type { Identity } from '../auth/workspace.guard';
 export class TasksService {
   constructor(private readonly db: PrismaService) {}
 
-  async list(identity: Identity, scope?: 'mine' | 'queue') {
+  async list(identity: Identity, scope?: 'mine' | 'queue', applicationId?: string) {
     const where = {
       workspaceId: identity.workspaceId,
       ...(scope === 'mine' ? { assigneeId: identity.actorId } : {}),
       ...(scope === 'queue' ? { assigneeId: null } : {}),
+      ...(applicationId ? { applicationId } : {}),
     };
     const tasks = await this.db.humanTask.findMany({
       where,
@@ -90,6 +91,7 @@ function toFrontendTask(task: {
   linkRoute: string;
   candidateId: string | null;
   jobId: string | null;
+  applicationId: string | null;
 }) {
   return {
     id: task.id,
@@ -110,5 +112,6 @@ function toFrontendTask(task: {
     linkRoute: task.linkRoute,
     candidateId: task.candidateId || undefined,
     jobId: task.jobId || undefined,
+    applicationId: task.applicationId || undefined,
   };
 }
