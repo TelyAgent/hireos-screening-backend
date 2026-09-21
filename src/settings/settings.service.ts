@@ -1,11 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { PrismaService } from '../persistence/prisma.service';
 import type { Identity } from '../auth/workspace.guard';
-import { MailService, MailApiError, type MailInboxMessage, type MailboxCredentials } from './mail.service';
+import { MailService, MailApiError, type MailInboxMessage, type MailAttachmentMessage, type MailboxCredentials } from './mail.service';
+import { ImportsService } from '../intake/imports.service';
 
 const corporateMailboxSchema = z.object({
   name: z.string().trim().max(200).optional(),
@@ -42,6 +44,7 @@ export class SettingsService {
   constructor(
     private readonly db: PrismaService,
     private readonly mail: MailService,
+    private readonly imports: ImportsService,
   ) {}
 
   async listConnections(identity: Identity) {
@@ -327,6 +330,60 @@ export class SettingsService {
     });
     await this.audit(identity, 'corporate_mailbox_synced', 'WorkspaceSetting', updated.id, { messageCount: recentMessages.length });
     return { ...serializeMailbox(id, payload), recentMessages };
+  }
+
+  // Pulls resume-looking attachments out of unseen mail and feeds them into the
+  // same intake pipeline a browser upload uses (Material -> ImportItem ->
+  // candidate creation), so "Import from email" is real ingestion, not just a
+  // status display. IMAP's own \Seen flag is the only dedupe state kept -- a
+  // message this already imported from never comes back on the next click.
+  async importFromMailbox(identity: Identity, id: string) {
+    const existing = await this.getMailboxSetting(identity.workspaceId, id);
+    if (!existing) throw new NotFoundException({ code: 'NOT_FOUND' });
+    const payload = existing.payload as any;
+    if (!payload.purposes?.inbound) {
+      throw new BadRequestException({ code: 'INBOUND_NOT_ENABLED', message: '请先为该邮箱启用"用于收件 / Recruiting Inbox"。' });
+    }
+    const creds: MailboxCredentials = { email: payload.email, password: payload.password, imapHost: payload.imapHost, imapPort: payload.imapPort, imapTls: payload.imapTls, smtpHost: payload.smtpHost, smtpPort: payload.smtpPort, smtpSecure: payload.smtpSecure };
+    let messages: MailAttachmentMessage[];
+    try {
+      messages = await this.mail.listUnseenResumeAttachments(creds, 20);
+    } catch (error) {
+      const message = error instanceof MailApiError ? error.message : '无法连接邮箱读取新邮件。';
+      throw new BadRequestException({ code: 'MAILBOX_IMPORT_FAILED', message });
+    }
+    // createBatch()/saveUpload() always run originalname through decodeOriginalFileName()
+    // (Buffer.from(name,'latin1').toString('utf8')), because that's the fix for how
+    // Node's multipart parser mangles real HTTP uploads. imapflow already hands back a
+    // correctly-decoded Unicode filename (it resolves MIME encoded-words itself), so
+    // running it through that same fix a second time would mangle it again -- e.g. a
+    // Chinese filename can come out containing an embedded NUL byte, which Postgres
+    // rejects outright. Pre-encoding into the same raw latin1 representation here keeps
+    // the single decode step consistent for every caller instead of special-casing channels.
+    const files = messages.flatMap((m) =>
+      m.attachments.map(
+        (a) =>
+          ({
+            originalname: Buffer.from(a.filename, 'utf8').toString('latin1'),
+            mimetype: a.mimetype,
+            size: a.buffer.length,
+            buffer: a.buffer,
+          }) as unknown as Express.Multer.File,
+      ),
+    );
+    let batchId: string | undefined;
+    if (files.length) {
+      const batch = await this.imports.createBatch(identity, files, 'email');
+      batchId = batch.id;
+      await this.mail.markSeen(creds, messages.map((m) => m.uid)).catch(() => undefined);
+    }
+    const updatedPayload = { ...payload, lastSyncedAt: new Date().toISOString(), lastSyncMessageCount: messages.length };
+    await this.db.workspaceSetting.update({
+      where: { id: existing.id },
+      data: { payload: updatedPayload as Prisma.InputJsonValue, version: existing.version + 1, updatedBy: identity.actorId },
+    });
+    await this.audit(identity, 'corporate_mailbox_email_import', 'WorkspaceSetting', existing.id, { messagesScanned: messages.length, attachmentsImported: files.length });
+    return { mailbox: serializeMailbox(id, updatedPayload), messagesScanned: messages.length, attachmentsImported: files.length, batchId };
   }
 
   private getMailboxSetting(workspaceId: string, id: string) {

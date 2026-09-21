@@ -108,4 +108,9 @@ export class SettingsController {
   syncCorporateMailbox(@Req() req: { identity: Identity }, @Param('id') id: string) {
     return this.settings.syncCorporateMailbox(req.identity, id);
   }
+
+  @Post('settings/corporate-mailboxes/:id/import')
+  importFromMailbox(@Req() req: { identity: Identity }, @Param('id') id: string) {
+    return this.settings.importFromMailbox(req.identity, id);
+  }
 }
