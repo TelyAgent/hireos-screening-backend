@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../persistence/prisma.service';
@@ -15,6 +15,8 @@ type ProfileForMatch = {
   skills: unknown;
   workAuthorization: unknown;
   location: unknown;
+  employmentHistory: unknown;
+  education: unknown;
 };
 type CandidateForMatch = {
   id: string;
@@ -64,12 +66,59 @@ export class DiscoveryService implements OnModuleInit, OnModuleDestroy {
   }
 
   async matchCandidate(identity: Identity, candidateId: string) {
+    const activeJob = await this.db.processingJob.findFirst({
+      where: { workspaceId: identity.workspaceId, candidateId, type: AUTO_MATCH_JOB, status: { in: ['queued', 'running'] } },
+      select: { id: true },
+    });
+    if (activeJob) {
+      throw new ConflictException({ code: 'MATCH_IN_PROGRESS', message: 'A matching run is already in progress for this candidate.' });
+    }
     const candidate = await this.db.candidate.findFirst({
       where: { id: candidateId, workspaceId: identity.workspaceId },
       include: CANDIDATE_MATCH_INCLUDE,
     });
     if (!candidate) throw new NotFoundException({ code: 'NOT_FOUND' });
     return serializeRun(await this.runMatchForCandidate(identity.workspaceId, candidate));
+  }
+
+  // Single source of truth for "is a match already in flight for this candidate" --
+  // covers both the queued-but-unclaimed window and the actively-running window, so
+  // callers (candidate detail, library list) can disable manual re-match controls
+  // instead of racing the background auto-match queue.
+  async getMatchingStatuses(workspaceId: string, candidateIds: string[]) {
+    type LastRun = { status: string; jobsScanned: number; reason: unknown; lastRunAt: string; completedAt: string | null };
+    const result = new Map<string, { isMatching: boolean; lastRun: LastRun | null }>();
+    if (!candidateIds.length) return result;
+    const [activeJobs, lastRuns] = await Promise.all([
+      this.db.processingJob.findMany({
+        where: { workspaceId, type: AUTO_MATCH_JOB, candidateId: { in: candidateIds }, status: { in: ['queued', 'running'] } },
+        select: { candidateId: true },
+      }),
+      this.db.jobDiscoveryRun.findMany({
+        where: { workspaceId, candidateId: { in: candidateIds } },
+        orderBy: { createdAt: 'desc' },
+        distinct: ['candidateId'],
+        select: { candidateId: true, status: true, jobsScanned: true, reason: true, createdAt: true, completedAt: true },
+      }),
+    ]);
+    const activeSet = new Set(activeJobs.map((j) => j.candidateId).filter((id): id is string => Boolean(id)));
+    const lastRunMap = new Map(lastRuns.map((r) => [r.candidateId, r]));
+    for (const id of candidateIds) {
+      const run = lastRunMap.get(id);
+      result.set(id, {
+        isMatching: activeSet.has(id),
+        lastRun: run
+          ? {
+              status: run.status,
+              jobsScanned: run.jobsScanned,
+              reason: run.reason,
+              lastRunAt: run.createdAt.toISOString(),
+              completedAt: run.completedAt?.toISOString() ?? null,
+            }
+          : null,
+      });
+    }
+    return result;
   }
 
   async matchJob(identity: Identity, jobId: string) {
@@ -289,7 +338,7 @@ export class DiscoveryService implements OnModuleInit, OnModuleDestroy {
 
     const requirements = asArray(criteria.requirements) as unknown as JobRequirementInput[];
     const dimensions = asArray(criteria.dimensions) as unknown as JobDimensionInput[];
-    const resumeText = candidate.resumeVersions[0]?.material.text || '';
+    const resumeText = buildResumeText(candidate, profile);
 
     let evaluation: {
       overallScore: number;
@@ -409,11 +458,55 @@ function asArray(value: unknown): JsonRecord[] {
     : [];
 }
 
+function asAnyArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function skillNames(skills: unknown): string[] {
+  return asAnyArray(skills)
+    .map((item) => (item && typeof item === 'object' && 'name' in item ? String((item as JsonRecord).name || '') : String(item)))
+    .filter(Boolean);
+}
+
 function profileCorpus(profile: ProfileForMatch) {
-  const skills = asArray(profile.skills).map((item) => String(item.name || '').toLowerCase());
+  const skills = skillNames(profile.skills).map((s) => s.toLowerCase());
   const workAuth = String(asRecord(profile.workAuthorization)?.value || '').toLowerCase();
   const location = String(asRecord(profile.location)?.value || '').toLowerCase();
-  return `${skills.join(' ')} ${workAuth} ${location}`.toLowerCase();
+  const employmentText = employmentHistoryText(profile.employmentHistory).toLowerCase();
+  return `${skills.join(' ')} ${workAuth} ${location} ${employmentText}`.toLowerCase();
+}
+
+function employmentHistoryText(employmentHistory: unknown): string {
+  return asAnyArray(employmentHistory)
+    .map((entry) => {
+      const record = asRecord(entry);
+      if (!record) return '';
+      const achievements = asAnyArray(record.achievements).map(String).join(' ');
+      return [record.company, record.title, achievements].filter(Boolean).join(' ');
+    })
+    .filter(Boolean)
+    .join(' ');
+}
+
+/**
+ * Manually pasted candidates have no uploaded resume material — the closest thing
+ * to resume text is the free-form background notes captured as employment history.
+ * Without this fallback the AI matcher never runs for them (resumeText gate below).
+ */
+function buildResumeText(candidate: CandidateForMatch, profile?: ProfileForMatch): string {
+  const materialText = candidate.resumeVersions[0]?.material.text || '';
+  if (materialText.trim()) return materialText;
+  if (!profile) return '';
+  const skills = skillNames(profile.skills);
+  const education = asAnyArray(profile.education).map((item) => String(asRecord(item)?.statement || '')).filter(Boolean);
+  const employment = employmentHistoryText(profile.employmentHistory);
+  const parts = [
+    `候选人：${candidate.displayName}`,
+    skills.length ? `技能：${skills.join('、')}` : '',
+    employment ? `工作背景：${employment}` : '',
+    education.length ? `教育经历：${education.join('；')}` : '',
+  ].filter(Boolean);
+  return parts.join('\n');
 }
 
 function requirementMatches(requirement: JobRequirementInput, corpus: string) {

@@ -1,6 +1,6 @@
 import { ConflictException, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Identity } from '../auth/workspace.guard';
 
 type CoreRecordMode = 'mock' | 'remote';
@@ -110,7 +110,7 @@ export class CoreRecordClient {
         'x-correlation-id': `${this.serviceName}:${randomUUID()}`,
         'x-source-service': this.serviceName,
         'x-workspace-id': identity.workspaceId,
-        ...(input.idempotencyKey ? { 'idempotency-key': input.idempotencyKey } : {}),
+        ...(input.idempotencyKey ? { 'idempotency-key': hashIdempotencyKey(input.idempotencyKey) } : {}),
       },
       body: input.body === undefined ? undefined : JSON.stringify(input.body),
     });
@@ -127,6 +127,13 @@ export class CoreRecordClient {
     }
     return body as T;
   }
+}
+
+function hashIdempotencyKey(raw: string): string {
+  // Idempotency keys often embed free-text (candidate names, job titles) which
+  // may contain non-Latin1 characters; HTTP header values must be ByteStrings,
+  // so hash rather than pass the raw text through.
+  return createHash('sha256').update(raw).digest('hex');
 }
 
 async function parseBody(response: Response) {
