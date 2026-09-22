@@ -891,3 +891,25 @@ model WorkspaceSetting {
   @@unique([workspaceId, kind, key])
   @@index([workspaceId, kind, updatedAt])
 }
+
+// Screening's own transactional outbox (see docs/HireOS-Database-Architecture-Decision.md
+// §7/§9) -- written in the same transaction as the business fact it announces (a decision
+// moving a candidate to interview), so the two can never disagree. A background dispatcher
+// (InterviewHandoffDispatcherService) polls for `pending` rows and delivers them over HTTP
+// to the receiving subsystem; this table is the durability/retry backstop for that delivery,
+// not a replacement for a real event bus -- swapping the transport later doesn't change
+// this schema or the payload envelope.
+model ScreeningOutboxEvent {
+  id           String    @id @default(uuid())
+  workspaceId  String
+  eventType    String
+  aggregateId  String
+  payload      Json
+  status       String    @default("pending") // pending | dispatched | failed
+  attempt      Int       @default(0)
+  lastError    String?
+  createdAt    DateTime  @default(now())
+  dispatchedAt DateTime?
+
+  @@index([workspaceId, status, createdAt])
+}

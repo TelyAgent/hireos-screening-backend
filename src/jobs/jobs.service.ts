@@ -389,6 +389,16 @@ function asArray(value: unknown) {
   return Array.isArray(value) ? value : [];
 }
 
+// Single source of truth for "does this job require a completed Assessment before
+// Interview" -- used both to gate DecisionsService.record's move_to_interview path and
+// to tell the frontend (via toFrontendJob's workflowPolicy) whether to show the
+// exception-request UI. Deliberately NOT based on seniority: a Senior job doesn't imply
+// an assessment is required -- recruiters should be free to choose "Send Assessment" or
+// "Move to Interview" for any job unless it (or an explicit title marker) opts in.
+export function jobRequiresAssessment(job: { assessmentRequired: boolean; title: string }): boolean {
+  return job.assessmentRequired || job.title.toLowerCase().includes('assessment-required');
+}
+
 function toFrontendJob(job: {
   id: string;
   title: string;
@@ -425,7 +435,7 @@ function toFrontendJob(job: {
     responsibilities: remoteCriteria?.responsibilities || [],
     requirements: asArray(criteria?.requirements),
     dimensions: asArray(criteria?.dimensions),
-    workflowPolicy: { assessmentDisposition: 'optional', decisionApprovalsRequired: 1, exceptionApprovalRoles: ['emma', 'daniel'] },
+    workflowPolicy: { assessmentDisposition: jobRequiresAssessment(job) ? 'required' : 'optional', decisionApprovalsRequired: 1, exceptionApprovalRoles: ['emma', 'daniel'] },
     openings: job.openings,
     applicantCount: job.applicantCount,
     assessmentRequired: job.assessmentRequired,

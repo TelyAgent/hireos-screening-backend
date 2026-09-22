@@ -2,6 +2,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../persistence/prisma.service';
+import { jobRequiresAssessment } from '../jobs/jobs.service';
 import type { Identity } from '../auth/workspace.guard';
 
 const OUTCOMES = ['strong_advance', 'advance', 'hold', 'do_not_advance', 'request_information'];
@@ -23,7 +24,7 @@ export class DecisionsService {
     }
     const application = await this.db.application.findFirst({
       where: { id: applicationId, workspaceId: identity.workspaceId },
-      include: { job: true },
+      include: { job: true, candidate: true },
     });
     if (!application) throw new NotFoundException({ code: 'NOT_FOUND' });
     const currentEvaluation = await this.db.screeningEvaluation.findFirst({
@@ -33,9 +34,7 @@ export class DecisionsService {
     if (raw.nextStepTarget === 'move_to_interview' && application.job.criteriaStatus !== 'confirmed') {
       throw new ConflictException({ code: 'CRITERIA_NOT_CONFIRMED' });
     }
-    const requiresAssessment = application.job.assessmentRequired ||
-      application.job.title.toLowerCase().includes('assessment-required') ||
-      application.job.seniority.toLowerCase() === 'senior';
+    const requiresAssessment = jobRequiresAssessment(application.job);
     if (
       requiresAssessment &&
       raw.nextStepTarget === 'move_to_interview' &&
@@ -99,6 +98,33 @@ export class DecisionsService {
         where: { workspaceId: identity.workspaceId, applicationId, taskType: 'screening_review', status: { notIn: ['completed', 'cancelled'] } },
         data: { status: 'completed', completedAt: new Date(), completionRef: created.id },
       });
+      // "Move to interview" is a fact Interview needs to know about. Written in this
+      // same transaction so the decision and the announcement of it can never disagree
+      // (see docs/HireOS-Database-Architecture-Decision.md §7/§9 -- Screening owns this
+      // event, a background dispatcher delivers it, Interview upserts by Core Record id).
+      if (raw.nextStepTarget === 'move_to_interview') {
+        await tx.screeningOutboxEvent.create({
+          data: {
+            workspaceId: identity.workspaceId,
+            eventType: 'candidate.advanced_to_interview',
+            aggregateId: applicationId,
+            payload: json({
+              coreJobId: application.jobId,
+              coreCandidateId: application.candidateId,
+              jobTitle: application.job.title,
+              jobDepartment: application.job.team || undefined,
+              jobLocation: application.job.location || undefined,
+              jobLevel: application.job.seniority || undefined,
+              jdText: application.job.jdText || undefined,
+              candidateName: application.candidate.displayName,
+              candidateEmail: application.candidate.email || undefined,
+              candidatePhone: application.candidate.phone || undefined,
+              matchScore: currentEvaluation?.overallScore != null ? Math.round(currentEvaluation.overallScore) : undefined,
+              matchRecommendation: mapMatchRecommendation(raw.outcome!),
+            }),
+          },
+        });
+      }
       return created;
     });
     const pkg = raw.nextStepTarget === 'send_assessment' || raw.nextStepTarget === 'move_to_interview'
@@ -259,4 +285,14 @@ function serializePackage(pkg: any) {
 
 function json(value: unknown): Prisma.InputJsonValue {
   return value as Prisma.InputJsonValue;
+}
+
+// Interview's InterviewTask.matchRecommendation is a free string (comment: strong_match |
+// match | weak_match) with no shared enum -- this is Screening's side of that informal
+// contract, derived from the human's own decision outcome rather than re-deriving it from
+// the AI evaluation, since the human's call is what actually sent the candidate onward.
+function mapMatchRecommendation(outcome: string): string {
+  if (outcome === 'strong_advance') return 'strong_match';
+  if (outcome === 'advance') return 'match';
+  return 'weak_match';
 }
