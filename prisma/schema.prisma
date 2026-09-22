@@ -9,14 +9,26 @@ datasource db {
 
 // Foundational material record. Domain-specific Candidate/Profile entities are
 // added in the Intake and Library phases.
+// The raw file itself is Core Record's Material master (see docs/HireOS-Database-
+// Architecture-Decision.md §4.1) -- coreMaterialId is that reference, and Core Record's
+// /materials/:id/content is the only place the original bytes are actually stored and
+// servable now (storageKey/local disk write dropped: nothing here ever read that file
+// back -- extraction runs once against the in-memory upload buffer, and no download
+// route ever served it, same dead weight as Interview's copy turned out to be). This
+// row stays local because text/segments/normalizedTextHash are Screening's own
+// extraction + dedup output (business-specific derivatives, not the file identity),
+// and everything downstream (ResumeVersion, ImportItem, DuplicateCheck, ...) keys off
+// this local id, not Core Record's. coreMaterialId is nullable because
+// CoreRecordClient.uploadMaterial returns null when CORE_RECORD_MODE=mock -- in that
+// case this row is exactly what it was before this migration.
 model Material {
   id               String            @id @default(uuid())
   workspaceId      String
+  coreMaterialId   String?           @unique
   name             String
   mime             String
   size             Int
   hash             String
-  storageKey       String
   text             String            @db.Text
   segments         Json
   readStatus       String            @default("pending")

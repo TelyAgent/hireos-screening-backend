@@ -1,13 +1,13 @@
 /* global require */
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { dirname, extname, join, resolve } from 'node:path';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { dirname, extname, join } from 'node:path';
 import { PDFParse } from 'pdf-parse';
 import * as mammoth from 'mammoth';
 import { PrismaService } from '../persistence/prisma.service';
+import { CoreRecordClient } from '../core-record/core-record.client';
+import type { Identity } from '../auth/workspace.guard';
 import type { ImportChannel } from './imports.types';
 import { SecurityScanService } from './security-scan.service';
 
@@ -27,11 +27,11 @@ const PDF_STANDARD_FONT_DATA_URL = join(PDFJS_DIR, 'standard_fonts') + '/';
 export class MaterialsService {
   constructor(
     private readonly db: PrismaService,
-    private readonly config: ConfigService,
     private readonly securityScan: SecurityScanService,
+    private readonly coreRecord: CoreRecordClient,
   ) {}
 
-  async saveUpload(workspaceId: string, file?: MulterFile, sourceType: ImportChannel = 'manual_upload') {
+  async saveUpload(identity: Identity, file?: MulterFile, sourceType: ImportChannel = 'manual_upload') {
     if (!file || !file.size) throw new BadRequestException({ code: 'EMPTY_FILE' });
     if (file.size > MAX_FILE_SIZE) {
       throw new BadRequestException({ code: 'FILE_TOO_LARGE', maxBytes: MAX_FILE_SIZE });
@@ -39,8 +39,15 @@ export class MaterialsService {
 
     const originalName = decodeOriginalFileName(file.originalname);
     const hash = createHash('sha256').update(file.buffer).digest('hex');
+
+    // Core Record's Material master (see docs/HireOS-Database-Architecture-Decision.md
+    // §4.1) now holds the raw bytes and dedupes by hash across every subsystem, not just
+    // this workspace. In CORE_RECORD_MODE=mock, uploadMaterial returns null and this
+    // falls back to the old workspace-local hash dedup -- exactly what ran before this
+    // migration, so mock mode is unaffected.
+    const coreMaterial = await this.coreRecord.uploadMaterial(identity, { buffer: file.buffer, originalname: originalName, mimetype: file.mimetype });
     const existing = await this.db.material.findFirst({
-      where: { workspaceId, hash },
+      where: coreMaterial ? { coreMaterialId: coreMaterial.id } : { workspaceId: identity.workspaceId, hash },
       select: { id: true, name: true, size: true, hash: true, readStatus: true, errorCode: true },
     });
     if (existing) return { kind: 'exact_file' as const, material: existing };
@@ -58,43 +65,32 @@ export class MaterialsService {
       ? createHash('sha256').update(normalizedText).digest('hex')
       : null;
 
-    const storageRoot = resolve(this.config.get<string>('STORAGE_DIR', '.local/materials'));
-    await mkdir(storageRoot, { recursive: true, mode: 0o700 });
-    const storageKey = randomUUID();
-    const storagePath = join(storageRoot, storageKey);
-    await writeFile(storagePath, file.buffer, { mode: 0o600, flag: 'wx' });
-
-    try {
-      const material = await this.db.material.create({
-        data: {
-          workspaceId,
-          name: originalName.slice(0, 255),
-          mime: parsed.mime,
-          size: file.size,
-          hash,
-          normalizedTextHash,
-          storageKey,
-          text: parsed.text,
-          segments: parsed.segments,
-          readStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
-          securityStatus: scan.status,
-          extractionStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
-          sourceType,
-          errorCode: parsed.errorCode,
-        },
-      });
-      return { kind: 'created' as const, material };
-    } catch (error) {
-      await unlink(storagePath).catch(() => undefined);
-      throw error;
-    }
+    const material = await this.db.material.create({
+      data: {
+        workspaceId: identity.workspaceId,
+        coreMaterialId: coreMaterial?.id,
+        name: originalName.slice(0, 255),
+        mime: parsed.mime,
+        size: file.size,
+        hash,
+        normalizedTextHash,
+        text: parsed.text,
+        segments: parsed.segments,
+        readStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
+        securityStatus: scan.status,
+        extractionStatus: scan.status === 'quarantined' ? 'blocked' : parsed.errorCode ? 'failed' : 'available',
+        sourceType,
+        errorCode: parsed.errorCode,
+      },
+    });
+    return { kind: 'created' as const, material };
   }
 
   async get(workspaceId: string, id: string) {
     const material = await this.db.material.findFirst({
       where: { id, workspaceId },
       select: {
-        id: true, name: true, mime: true, size: true, hash: true, text: true,
+        id: true, coreMaterialId: true, name: true, mime: true, size: true, hash: true, text: true,
         segments: true, readStatus: true, securityStatus: true, extractionStatus: true,
         sourceType: true, sourceRef: true, sourceVersion: true, errorCode: true, createdAt: true,
       },

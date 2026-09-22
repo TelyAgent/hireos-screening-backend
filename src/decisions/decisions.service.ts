@@ -24,7 +24,10 @@ export class DecisionsService {
     }
     const application = await this.db.application.findFirst({
       where: { id: applicationId, workspaceId: identity.workspaceId },
-      include: { job: true, candidate: true },
+      include: {
+        job: true,
+        candidate: { include: { resumeVersions: { where: { isLatest: true }, take: 1, include: { material: true } } } },
+      },
     });
     if (!application) throw new NotFoundException({ code: 'NOT_FOUND' });
     const currentEvaluation = await this.db.screeningEvaluation.findFirst({
@@ -119,6 +122,11 @@ export class DecisionsService {
               candidateName: application.candidate.displayName,
               candidateEmail: application.candidate.email || undefined,
               candidatePhone: application.candidate.phone || undefined,
+              // A stable reference, not the file itself (see screeningHandoffSchema's
+              // comment on the receiving end) -- only set once that résumé's own Material
+              // has been registered with Core Record (CORE_RECORD_MODE=remote); in mock
+              // mode Interview just won't get a résumé automatically, same as before.
+              coreMaterialId: application.candidate.resumeVersions[0]?.material.coreMaterialId || undefined,
               matchScore: currentEvaluation?.overallScore != null ? Math.round(currentEvaluation.overallScore) : undefined,
               matchRecommendation: mapMatchRecommendation(raw.outcome!),
             }),

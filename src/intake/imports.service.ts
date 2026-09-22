@@ -245,7 +245,7 @@ export class ImportsService implements OnModuleInit, OnModuleDestroy {
   ) {
     try {
       await this.updateItem(identity, operationId, batchId, itemId, { stage: 'validating', outcome: 'validating' });
-      const saved = await this.materials.saveUpload(identity.workspaceId, file, channel);
+      const saved = await this.materials.saveUpload(identity, file, channel);
       await this.processSavedMaterial(identity, operationId, batchId, itemId, saved, channel);
     } catch (error) {
       await this.failItem(identity, operationId, batchId, itemId, error);

@@ -28,7 +28,7 @@ export class IntakeController {
   @Post('materials')
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 25 * 1024 * 1024, files: 1 } }))
   upload(@Req() req: { identity: Identity }, @UploadedFile() file?: MulterFile) {
-    return this.materials.saveUpload(req.identity.workspaceId, file);
+    return this.materials.saveUpload(req.identity, file);
   }
 
   @Get('materials/:id')

@@ -41,6 +41,16 @@ export type CoreApplication = {
   version: number;
 };
 
+export type CoreMaterial = {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  hash: string;
+  readStatus: string;
+  securityStatus: string;
+};
+
 @Injectable()
 export class CoreRecordClient {
   private readonly mode: CoreRecordMode;
@@ -95,6 +105,42 @@ export class CoreRecordClient {
       idempotencyKey,
       body: input,
     });
+  }
+
+  /**
+   * Registers a file with Core Record's shared Material master (see
+   * docs/HireOS-Database-Architecture-Decision.md §4.1) -- mirrors createCandidate/
+   * createJob/createApplication's mock/remote split: in 'mock' mode this returns null
+   * and MaterialsService.saveUpload falls back to its old local-only behavior (local
+   * hash dedup, local disk write) exactly like it did before this migration.
+   */
+  async uploadMaterial(identity: Identity, file: { buffer: Buffer; originalname: string; mimetype: string }): Promise<CoreMaterial | null> {
+    if (this.mode === 'mock') return null;
+    const form = new FormData();
+    // Buffer's underlying ArrayBufferLike can theoretically be a SharedArrayBuffer, which
+    // BlobPart's type doesn't accept -- Uint8Array.from copies into a plain, freshly
+    // allocated ArrayBuffer to satisfy that.
+    form.append('file', new Blob([Uint8Array.from(file.buffer)], { type: file.mimetype }), file.originalname);
+    const response = await globalThis.fetch(`${this.baseUrl}/materials`, {
+      method: 'POST',
+      headers: {
+        'x-request-id': randomUUID(),
+        'x-correlation-id': `${this.serviceName}:${randomUUID()}`,
+        'x-source-service': this.serviceName,
+        'x-workspace-id': identity.workspaceId,
+        'idempotency-key': randomUUID(),
+      },
+      body: form,
+    });
+    const body = await parseBody(response);
+    if (!response.ok) {
+      const error = body as { code?: string; message?: string };
+      throw new ServiceUnavailableException({
+        code: error.code || 'CORE_RECORD_UNAVAILABLE',
+        message: error.message || `Core Record returned HTTP ${response.status}.`,
+      });
+    }
+    return body as CoreMaterial;
   }
 
   private async request<T>(
